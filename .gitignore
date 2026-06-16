@@ -1,0 +1,50 @@
+# Personal data — never commit
+statements/
+data/
+
+# Reference material (zips of FIFRO) — kept locally, not pushed
+reference/
+
+# Old Excel budget
+budget.xlsx
+
+# Node
+node_modules/
+.pnpm-store/
+pnpm-debug.log
+.npm
+.eslintcache
+
+# Build outputs
+apps/api/dist/
+apps/web/build/
+apps/web/.svelte-kit/
+apps/mcp/dist/
+packages/core/dist/
+packages/db/dist/
+
+# Vite / SvelteKit caches
+.vite/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Claude Code agent state (worktrees, logs, plans/session scratch)
+.claude/
+
+# llama.cpp binary (downloaded at runtime)
+bin/llama-cpp/
+
+# Logs
+*.log
+logs/
+
+# Backup files
+*.bak
+*.orig

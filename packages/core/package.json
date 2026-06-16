@@ -1,0 +1,47 @@
+{
+  "name": "@budgetkit/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./retirement_projector": {
+      "types": "./dist/retirement_projector.d.ts",
+      "import": "./dist/retirement_projector.js"
+    },
+    "./account_tax": {
+      "types": "./dist/account_tax.d.ts",
+      "import": "./dist/account_tax.js"
+    },
+    "./budget_math": {
+      "types": "./dist/budget_math.d.ts",
+      "import": "./dist/budget_math.js"
+    },
+    "./money": {
+      "types": "./dist/money.d.ts",
+      "import": "./dist/money.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.7.76",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -1,0 +1,10 @@
+# Normalize line endings: store text as LF in the repo, let Git convert on
+# checkout per the platform. Keeps diffs clean across Windows / macOS / Linux.
+* text=auto
+
+# Shell scripts must stay LF even on a Windows checkout — a CRLF in the shebang
+# line breaks `bash run.sh` on macOS/Linux ("bad interpreter").
+*.sh text eol=lf
+
+# Windows batch files want CRLF.
+*.bat text eol=crlf

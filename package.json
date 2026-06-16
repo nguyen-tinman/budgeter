@@ -1,0 +1,21 @@
+{
+  "name": "budgetkit-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first personal finance app with LLM tool-calling and MCP — monorepo root",
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,magenta \"pnpm --filter @budgetkit/api dev\" \"pnpm --filter @budgetkit/web dev\"",
+    "build": "pnpm --filter @budgetkit/core build && pnpm --filter @budgetkit/db build && pnpm --filter @budgetkit/api build && pnpm --filter @budgetkit/web build && pnpm --filter @budgetkit/mcp build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "verify": "pnpm -r test && pnpm -r typecheck && pnpm build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1",
+    "typescript": "^5.6.3"
+  },
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=24"
+  }
+}
