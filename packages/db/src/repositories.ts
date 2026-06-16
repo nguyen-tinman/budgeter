@@ -233,7 +233,7 @@ function incomeRepo(db: DatabaseSync): IncomeRepo {
           args.label,
           round2(args.grossAnnualDollars),
           args.taxStatus,
-          args.isFederalIncomeTax ?? true ? 1 : 0,
+          (args.isFederalIncomeTax ?? true) ? 1 : 0,
           args.filingRole ?? "primary",
         );
       return { id: Number(r.lastInsertRowid) };

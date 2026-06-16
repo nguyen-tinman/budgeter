@@ -579,7 +579,7 @@ export class LlamaLauncher {
       this.status = "error";
       this.lastError = `health check timed out; stderr tail: ${stderrTail.slice(-512)}`;
       // Capture `this.proc` locally — between the if-check and the kill,
-      // another caller (or the 'exit' handler on line 365) may have set
+      // another caller (or the process 'exit' handler above) may have set
       // `this.proc = null`, causing a TOCTOU NPE. We also stop touching
       // `this.proc` after the kill so we don't trample a fresh proc spawned
       // by a concurrent attemptStart() call.
