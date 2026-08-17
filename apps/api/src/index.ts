@@ -9,6 +9,8 @@ import { openDb, migrate, buildToolCtx } from "@budgetkit/db";
 import { toolsRouter } from "./routes/tools.js";
 import { chatRouter } from "./routes/chat.js";
 import { llamaRouter, autoStartLlama, killSharedLlamaSync } from "./routes/llama.js";
+import { undoRouter } from "./routes/undo.js";
+import { customPageStatusRouter } from "./routes/custom_page_status.js";
 
 /** Anchor cwd to the project root before any tool handler runs. Some tools
  *  (list_statements, catalogue_expenses) resolve paths via
@@ -110,10 +112,14 @@ app.use("/api/tools/*", apiBodyLimit);
 app.use("/api/chat/*", apiBodyLimit);
 app.use("/api/chat", apiBodyLimit);
 app.use("/api/llama/*", apiBodyLimit);
+app.use("/api/undo", apiBodyLimit);
+app.use("/api/custom-page/*", apiBodyLimit);
 
 app.route("/api/tools", toolsRouter());
 app.route("/api/chat", chatRouter());
 app.route("/api/llama", llamaRouter());
+app.route("/api/undo", undoRouter());
+app.route("/api/custom-page/status", customPageStatusRouter());
 
 const port = Number(process.env.PORT ?? 3000);
 // Bind to loopback only. This is a local-first single-user app — there's no

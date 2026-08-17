@@ -6,7 +6,7 @@
 // Testability: `spawnFn` is injectable so tests don't shell out to a real
 // binary. Production passes child_process.spawn.
 
-import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import { cpus } from "node:os";
@@ -87,10 +87,33 @@ export interface ModelSpec {
   sizeRank: number;
   /** Short note surfaced in the Setup UI. */
   blurb: string;
-  /** Speculative-decoding mode this GGUF supports. The 2B-MTP build ships
-   *  packed MTP heads (draft-mtp self-draft); the plain 4B GGUF does not, so
-   *  it runs without speculation ("none"). */
+  /** Speculative-decoding mode this GGUF supports. Both registry entries are
+   *  MTP builds with packed self-draft heads, so both declare "draft-mtp"; the
+   *  plain (non-MTP) upstream GGUFs would have to declare "none". */
   specType: NonNullable<LlamaProfile["specType"]>;
+  /** Peak dedicated VRAM in MiB, MEASURED at ctxSize 131072 on Vulkan with
+   *  full offload, sampled across load and generation. `mtp` is with
+   *  speculation at the default draft length, `noMtp` with --spec-type none.
+   *  The gap is almost entirely the extra nextn attention layer's KV cache,
+   *  which is why disabling speculation is a real memory lever and not just a
+   *  speed knob. Used by speculationFor() to decide if MTP fits. */
+  vramMib: { mtp: number; noMtp: number };
+  /** `--spec-draft-n-max` for THIS model. Per-model because the optimum is not
+   *  a property of the algorithm — it is where each model's verify-batch cost
+   *  crosses its own accept rate, and the two models land nowhere near each
+   *  other (2B: 8, 4B: 3). Measured; see the table at defaultProfile. */
+  specDraftNMax: number;
+  /** Is this model usable with no GPU at all? Gates the bottom rung of the
+   *  degradation ladder — the CPU fallback runs the largest present model for
+   *  which this is true, NOT necessarily the model that was loaded.
+   *
+   *  The 2B measures 23.8 tok/s on CPU (16 threads, q8_0 KV, draft length 2):
+   *  slow but usable for chat. The 4B is 2.1x the weights and ~1.9x the KV
+   *  cache, which puts it in the low single digits — technically it loads, but
+   *  a reply would take minutes, so we do not offer it. That is an inference
+   *  from the 2B measurement and the size ratio, not a measurement of the 4B
+   *  itself; if you ever measure it, put the number here. */
+  cpuCapable: boolean;
 }
 
 export const MODEL_REGISTRY: ModelSpec[] = [
@@ -102,19 +125,31 @@ export const MODEL_REGISTRY: ModelSpec[] = [
     sizeRank: 1,
     blurb: "Default. ~1.3 GB. Fast, light on VRAM; ships MTP self-draft heads.",
     specType: "draft-mtp",
+    vramMib: { mtp: 2750, noMtp: 2377 },
+    specDraftNMax: 8,
+    cpuCapable: true,
   },
   {
     id: "qwen3.5-4b",
     label: "Qwen 3.5 4B",
-    fileName: "Qwen3.5-4B-UD-Q5_K_XL.gguf",
-    url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-UD-Q5_K_XL.gguf?download=true",
+    // Local name carries "MTP" deliberately. The MTP repo publishes the same
+    // UD-Q5_K_XL filename as the plain 4B repo, so reusing that name would let
+    // an already-downloaded NON-MTP file be detected as present and then
+    // launched with --spec-type draft-mtp against a GGUF that has no heads.
+    fileName: "Qwen3.5-4B-MTP-UD-Q5_K_XL.gguf",
+    url: "https://huggingface.co/unsloth/Qwen3.5-4B-MTP-GGUF/resolve/main/Qwen3.5-4B-UD-Q5_K_XL.gguf?download=true",
     sizeRank: 2,
-    // VRAM note: 4B weights (~3 GB) + 128k f16 KV-cache is materially heavier
-    // than the 2B. We keep nGpuLayers:99 (full offload) and lean on the
-    // existing Vulkan→CPU fallback if the GPU can't allocate.
-    blurb: "Smarter. ~3 GB. Heavier on VRAM at 128k context; falls back to CPU if it won't fit.",
-    // Plain 4B GGUF — no packed MTP heads, so no self-draft speculation.
-    specType: "none",
+    // VRAM note, peak measured at -c 131072 on Vulkan with the default
+    // speculation and q8_0 KV: 6,183 MiB, versus 2,750 MiB for the 2B. We keep
+    // nGpuLayers:99 (full offload) and lean on the existing Vulkan→CPU
+    // fallback if the GPU can't allocate.
+    blurb: "Smarter. ~3.3 GB. Default when the GPU has room; ships MTP self-draft heads.",
+    // MTP build, same as the 2B — packed draft heads, so self-draft
+    // speculation is available on both models.
+    specType: "draft-mtp",
+    vramMib: { mtp: 6183, noMtp: 5542 },
+    specDraftNMax: 3,
+    cpuCapable: false,
   },
 ];
 
@@ -163,6 +198,342 @@ export function selectModelId(
     b.spec.sizeRank > a.spec.sizeRank ? b : a,
   );
   return largest.spec.id;
+}
+
+// ---------------------------------------------------------------------------
+// GPU detection + first-run model choice.
+//
+// Everywhere else GPU handling is REACTIVE: ask for full offload, and fall back
+// to CPU if Vulkan init fails (see start()). That is the right behaviour for a
+// model already on disk, but it cannot help the one decision made before any
+// download exists — which model to fetch in the first place. A 1.3 GB download
+// onto a 16 GB GPU wastes the hardware; a 3.3 GB one onto a 4 GB GPU spends
+// twenty minutes downloading a model that will crawl on the CPU.
+// ---------------------------------------------------------------------------
+
+export interface GpuInfo {
+  name: string;
+  totalMiB: number;
+  freeMiB: number;
+}
+
+/** `Vulkan0: NVIDIA GeForce RTX 5060 Ti (15962 MiB, 15194 MiB free)` */
+const DEVICE_LINE_RE = /^\s*\S+:\s*(.+?)\s*\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)\s*$/;
+
+/** Parse `llama-server --list-devices` output. Exported for tests, which must
+ *  be able to exercise the policy without a GPU present. */
+export function parseDeviceList(stdout: string): GpuInfo[] {
+  const out: GpuInfo[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const m = DEVICE_LINE_RE.exec(line);
+    if (m) out.push({ name: m[1]!, totalMiB: Number(m[2]), freeMiB: Number(m[3]) });
+  }
+  return out;
+}
+
+let gpuCache: GpuInfo | null | undefined;
+
+/**
+ * Ask llama.cpp itself what it can see. The runtime that has to allocate the
+ * memory is the authority — no vendor SDKs, no WMI, and no divergence between
+ * what we probe and what actually loads.
+ *
+ * Returns the largest device by free VRAM, or null when there is no GPU, the
+ * binary is missing, or the probe fails for any reason. Cached for the process
+ * lifetime: it costs a subprocess and the answer does not change usefully.
+ */
+export function detectGpu(binPath = findInstalledLlamaServer()): GpuInfo | null {
+  if (gpuCache !== undefined) return gpuCache;
+  if (!binPath) return (gpuCache = null);
+  try {
+    const res = spawnSync(binPath, ["--list-devices"], {
+      encoding: "utf8",
+      timeout: 10_000,
+      windowsHide: true,
+    });
+    const devices = parseDeviceList(`${res.stdout ?? ""}\n${res.stderr ?? ""}`);
+    gpuCache = devices.length === 0
+      ? null
+      : devices.reduce((a, b) => (b.freeMiB > a.freeMiB ? b : a));
+  } catch {
+    gpuCache = null;
+  }
+  return gpuCache;
+}
+
+/** Test seam: drop the memoized probe result. */
+export function resetGpuCache(): void {
+  gpuCache = undefined;
+}
+
+/** Free VRAM at or above which the 4B is the better default.
+ *
+ *  MEASURED, not estimated (RTX 5060 Ti, Vulkan, -c 131072, -ngl 99, -fa on,
+ *  q8_0 KV), as a peak sampled across load and generation: the 4B holds
+ *  6,183 MiB of dedicated VRAM and the 2B holds 2,750 MiB.
+ *
+ *  This bar was 10 GB when the KV cache was f16 and the 4B needed 8,351 MiB.
+ *  Switching the cache to q8_0 took 2.2 GB off that number at no speed cost
+ *  (it is in fact slightly faster), which moves the 4B from "needs a 12 GB
+ *  card" to "fits an 8 GB card" — the single biggest reach improvement in this
+ *  file. 7 GB leaves ~0.8 GB over the measured peak for the desktop
+ *  compositor, the browser running this very app, and allocator slack. */
+export const GPU_VRAM_MIB_FOR_LARGE_MODEL = 7 * 1024;
+
+/** Draft length for the CPU path. Measured on the 2B with no GPU: speculation
+ *  off 17.6 tok/s, n=2 23.8 tok/s (1.35x), n=8 15.9 tok/s (SLOWER than off).
+ *  The GPU optimum for the same model is 8, so this is not a smaller version of
+ *  the same curve — without a GPU the verify batch is pure CPU work and depth
+ *  stops paying almost immediately. */
+export const CPU_SPEC_DRAFT_N_MAX = 2;
+
+/** Free VRAM we insist on keeping above a model's measured peak before turning
+ *  MTP on. Allocation is not the only claimant — the desktop compositor and the
+ *  browser running this very app grow and shrink underneath us — and an
+ *  allocation failure costs a fall back to CPU, which is far more expensive
+ *  than the speculation was worth. */
+export const VRAM_HEADROOM_MIB = 512;
+
+export interface SpeculationChoice {
+  specType: NonNullable<LlamaProfile["specType"]>;
+  specDraftNMax: number;
+  /** Why, for the launch log and the setup UI. */
+  reason: string;
+}
+
+/**
+ * Decide whether MTP speculation fits, given a GPU reading.
+ *
+ * Speculation is not free memory-wise: it allocates a KV cache for the model's
+ * extra nextn attention layer, measured under the shipping q8_0 cache at
+ * +373 MiB on the 2B and +641 MiB on the 4B (it was +490/+878 at f16).
+ * On a GPU with room that buys 1.42x/1.45x generation speed. On a GPU
+ * without room it buys an OOM and a fall back to CPU. So the same knob is a
+ * throughput dial above the line and a memory lever below it.
+ *
+ * Pure — the caller supplies the reading — so the policy is unit-testable on
+ * any machine.
+ */
+export function speculationFor(
+  spec: ModelSpec,
+  gpu: GpuInfo | null,
+): SpeculationChoice {
+  if (spec.specType === "none") {
+    return { specType: "none", specDraftNMax: 0, reason: "this build has no draft heads" };
+  }
+  if (!gpu) {
+    // No GPU means the CPU path, where start() forces specType none anyway.
+    // Saying so here keeps the profile honest rather than relying on that.
+    return { specType: "none", specDraftNMax: 0, reason: "no GPU detected" };
+  }
+  const needed = spec.vramMib.mtp + VRAM_HEADROOM_MIB;
+  if (gpu.freeMiB < needed) {
+    return {
+      specType: "none",
+      specDraftNMax: 0,
+      reason:
+        `${(gpu.freeMiB / 1024).toFixed(1)} GB free is under the ` +
+        `${(needed / 1024).toFixed(1)} GB ${spec.label} needs for MTP — running without ` +
+        `speculation, which fits in ${(spec.vramMib.noMtp / 1024).toFixed(1)} GB`,
+    };
+  }
+  return {
+    specType: spec.specType,
+    specDraftNMax: spec.specDraftNMax,
+    reason: `${(gpu.freeMiB / 1024).toFixed(1)} GB free — MTP speculation on at draft length ${spec.specDraftNMax}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Degradation ladder.
+//
+// speculationFor() picks a tier from a VRAM reading BEFORE launching, which
+// handles the predictable cases. It cannot handle the unpredictable one: the
+// reading is a snapshot, and between the probe and the allocation a game, a
+// second browser, or another model can take the memory. Then llama-server dies
+// with an allocation error and — until now — the user got a dead assistant and
+// a stderr tail.
+//
+// So allocation failure is treated as a signal rather than an outcome: step
+// down one rung and try again, telling the user what changed and why. The rungs
+// are ordered by what they cost the user, cheapest concession first:
+//
+//   1. same model, speculation off   -373/-641 MiB, ~30% slower, SAME answers
+//   2. smaller model, speculation on  -3.4 GB, faster, but a weaker model
+//   3. smaller model, speculation off
+//   4. CPU                            no VRAM at all, ~10x slower again
+//
+// Rung 1 before rung 2 is the deliberate part: speculation is a pure speed
+// knob, so giving it up changes nothing about what the assistant says, while
+// dropping to a smaller model changes every answer it gives. Trade speed before
+// quality.
+// ---------------------------------------------------------------------------
+
+/** One rung: a profile to try and a short phrase naming what it costs. */
+export interface LadderStep {
+  profile: LlamaProfile;
+  /** Human-readable tier name, e.g. "Qwen 3.5 2B without speculation". */
+  label: string;
+}
+
+/** Default presence test — is this model's GGUF on disk? Injectable so the
+ *  ladder can be unit-tested without multi-GB files. */
+export type PresenceFn = (spec: ModelSpec) => boolean;
+
+const defaultPresence: PresenceFn = (spec) => existsSync(modelPathFor(spec));
+
+/** The model the CPU rung should run: the largest present model that is usable
+ *  without a GPU. Null when the user has none of them downloaded — the caller
+ *  must then ask them to install one rather than launching something that will
+ *  take minutes per reply. */
+export function cpuFallbackModel(isPresent: PresenceFn = defaultPresence): ModelSpec | null {
+  const usable = MODEL_REGISTRY.filter((m) => m.cpuCapable && isPresent(m));
+  if (usable.length === 0) return null;
+  return usable.reduce((a, b) => (b.sizeRank > a.sizeRank ? b : a));
+}
+
+/** Turn a profile into its CPU-path equivalent on `spec`.
+ *
+ *  Two knobs must move with nGpuLayers, or the CPU path is quietly misconfigured:
+ *  nThreads (4 is right for a host-side prelude, wrong when every matmul runs on
+ *  the CPU) and the draft length (the GPU optimum of 8 is SLOWER than no
+ *  speculation at all here — see CPU_SPEC_DRAFT_N_MAX). */
+export function cpuProfileFor(profile: LlamaProfile, spec: ModelSpec): LlamaProfile {
+  return {
+    ...profile,
+    modelPath: modelPathFor(spec),
+    nGpuLayers: 0,
+    nThreads: cpus().length,
+    specType: spec.specType,
+    specDraftNMax: CPU_SPEC_DRAFT_N_MAX,
+  };
+}
+
+/**
+ * The rungs below `profile`, in the order they should be tried. Pure: presence
+ * is injected, so the whole policy is testable on a machine with no GGUFs and
+ * no GPU.
+ *
+ * Returns [] when there is nothing left to try — the caller reports the
+ * original failure, plus (via cpuFallbackModel returning null) an offer to
+ * install a CPU-capable model.
+ */
+export function degradationLadder(
+  profile: LlamaProfile,
+  isPresent: PresenceFn = defaultPresence,
+): LadderStep[] {
+  const steps: LadderStep[] = [];
+  const current = MODEL_REGISTRY.find((m) => profile.modelPath.endsWith(m.fileName));
+  const onGpu = profile.nGpuLayers > 0;
+  const speculating = Boolean(profile.specType && profile.specType !== "none");
+
+  if (onGpu && speculating) {
+    steps.push({
+      profile: { ...profile, specType: "none", specDraftNMax: 0 },
+      label: `${current?.label ?? "the model"} without speculation`,
+    });
+  }
+
+  if (onGpu && current) {
+    const smaller = MODEL_REGISTRY.filter(
+      (m) => m.sizeRank < current.sizeRank && isPresent(m),
+    ).sort((a, b) => b.sizeRank - a.sizeRank);
+    for (const spec of smaller) {
+      const base: LlamaProfile = { ...profile, modelPath: modelPathFor(spec) };
+      if (spec.specType !== "none") {
+        steps.push({
+          profile: { ...base, specType: spec.specType, specDraftNMax: spec.specDraftNMax },
+          label: spec.label,
+        });
+      }
+      steps.push({
+        profile: { ...base, specType: "none", specDraftNMax: 0 },
+        label: `${spec.label} without speculation`,
+      });
+    }
+  }
+
+  const cpuSpec = cpuFallbackModel(isPresent);
+  if (cpuSpec && !(profile.nGpuLayers === 0 && profile.modelPath.endsWith(cpuSpec.fileName))) {
+    steps.push({
+      profile: cpuProfileFor(profile, cpuSpec),
+      label: `${cpuSpec.label} on the CPU`,
+    });
+  }
+  return steps;
+}
+
+/** Name the tier a profile represents, for warning text: "Qwen 3.5 4B with
+ *  speculation", "Qwen 3.5 2B on the CPU". */
+export function describeProfile(profile: LlamaProfile): string {
+  const spec = MODEL_REGISTRY.find((m) => profile.modelPath.endsWith(m.fileName));
+  const name = spec?.label ?? "the model";
+  if (profile.nGpuLayers === 0) return `${name} on the CPU`;
+  return profile.specType && profile.specType !== "none"
+    ? `${name} with speculation`
+    : `${name}`;
+}
+
+/**
+ * Something the user can do about the current state, surfaced on /status so the
+ * UI can render a button instead of a paragraph of stderr.
+ *
+ * Only one kind so far: the assistant needs a model that runs without a GPU and
+ * none is downloaded. We deliberately do NOT start that download ourselves —
+ * it happens at the exact moment the user's GPU just failed, and spending a
+ * gigabyte of their bandwidth without asking is the wrong default.
+ */
+export interface LauncherAction {
+  kind: "install-model";
+  modelId: string;
+  label: string;
+  message: string;
+}
+
+/** Build the install-a-CPU-model prompt. Exported so the message is asserted in
+ *  tests rather than duplicated as a string literal. */
+export function installCpuModelAction(reason: string): LauncherAction | null {
+  const spec = MODEL_REGISTRY.filter((m) => m.cpuCapable).sort(
+    (a, b) => a.sizeRank - b.sizeRank,
+  )[0];
+  if (!spec) return null;
+  return {
+    kind: "install-model",
+    modelId: spec.id,
+    label: spec.label,
+    message:
+      `${reason} The models on this machine all need a GPU. ` +
+      `Install ${spec.label} to run the assistant on the CPU instead — slower ` +
+      `(around 24 tokens/sec), but it works with no GPU at all.`,
+  };
+}
+
+export interface SetupModelChoice {
+  modelId: string;
+  /** Human-readable justification, shown on /setup. */
+  reason: string;
+}
+
+/**
+ * Which model first-time setup should download. Pure: the caller supplies the
+ * GPU reading, so the policy is testable on any machine.
+ */
+export function chooseSetupModel(gpu: GpuInfo | null): SetupModelChoice {
+  const large = MODEL_REGISTRY.reduce((a, b) => (b.sizeRank > a.sizeRank ? b : a));
+  const small = MODEL_REGISTRY.reduce((a, b) => (b.sizeRank < a.sizeRank ? b : a));
+  if (!gpu) {
+    return { modelId: small.id, reason: "No GPU detected — using the lighter model for CPU." };
+  }
+  if (gpu.freeMiB >= GPU_VRAM_MIB_FOR_LARGE_MODEL) {
+    return {
+      modelId: large.id,
+      reason: `Detected ${gpu.name}, ${(gpu.freeMiB / 1024).toFixed(1)} GB free — enough for ${large.label}.`,
+    };
+  }
+  return {
+    modelId: small.id,
+    reason: `Detected ${gpu.name}, ${(gpu.freeMiB / 1024).toFixed(1)} GB free — not enough headroom for ${large.label} at full context, so using ${small.label}.`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +640,13 @@ export interface LlamaProfile {
    *  is 3; we explicitly pin it on the profile so it shows up in the args
    *  + is tunable per-profile. */
   specDraftNMax?: number;
+  /** `--cache-type-k` / `--cache-type-v`: precision of the KV cache. f16 is
+   *  llama-server's default; q8_0 halves it. At 128k the cache is the single
+   *  largest allocation (bigger than the weights), so this is the biggest VRAM
+   *  lever we have that does not cut context. Applied to the draft context too
+   *  (`-ctkd`/`-ctvd`) — leaving the MTP layer at f16 would keep a chunk of the
+   *  saving on the table. */
+  cacheType?: "f16" | "q8_0" | "q4_0";
   /** `--parallel`. Number of parallel slots llama-server reserves. Default
    *  "auto" picks 4. For a single-user app we only need 1 — the extra slots
    *  reserve KV cache + recurrent state we never use. */
@@ -310,6 +688,18 @@ export function buildArgs(profile: LlamaProfile): string[] {
     // forget that breaks coherence mid-conversation. Qwen3 has no SWA-style
     // window of its own; this is the right safety knob.
     "--no-context-shift",
+    // Tool calling REQUIRES the Jinja chat-template path: without --jinja
+    // llama-server uses its legacy formatter, which emits no tool_calls and
+    // silently degrades every /api/chat turn to plain prose. Current builds
+    // default to Jinja, but the binary intentionally floats on "latest"
+    // releases (llama_updater), so a default flip upstream would break tool
+    // calls with no signal. Pin it.
+    "--jinja",
+    // "auto" is today's llama-server default, pinned explicitly for the same
+    // reason. think_filter.ts tolerates both reasoning shapes (inline
+    // <think> blocks and a separate reasoning_content field), so this is a
+    // stability pin rather than a behavior change.
+    "--reasoning-format", "auto",
   ];
   if (profile.nThreads !== undefined) args.push("-t", String(profile.nThreads));
   // Newer llama.cpp requires an explicit value for -fa (on/off/auto), not
@@ -322,7 +712,22 @@ export function buildArgs(profile: LlamaProfile): string[] {
   // extra host-side copy before transfer. Skip them on the GPU path.
   if (profile.nGpuLayers === 0) {
     if (!profile.useMmap) args.push("--no-mmap");
-    if (profile.useMlock) args.push("--mlock");
+    // --mlock is NOT passed on Windows. llama-server aborts on startup with
+    //   llama-mmap.cpp:744: GGML_ASSERT(addr) failed
+    // whenever it is set, regardless of context size or free RAM (reproduced at
+    // 8k and 128k with 27 GB free). Locking pages needs a privilege the process
+    // does not hold, and llama.cpp asserts rather than degrading. Since this
+    // block only runs on the CPU-fallback path, passing it meant the fallback —
+    // our safety net for a GPU that will not initialise — crashed 100% of the
+    // time on the platform this app primarily targets.
+    if (profile.useMlock && process.platform !== "win32") args.push("--mlock");
+  }
+  if (profile.cacheType && profile.cacheType !== "f16") {
+    args.push("-ctk", profile.cacheType, "-ctv", profile.cacheType);
+    // The draft context keeps its own cache; it defaults to f16 independently.
+    if (profile.specType && profile.specType !== "none") {
+      args.push("-ctkd", profile.cacheType, "-ctvd", profile.cacheType);
+    }
   }
   if (profile.specType && profile.specType !== "none") {
     args.push("--spec-type", profile.specType);
@@ -357,6 +762,10 @@ export interface LauncherOptions {
   client?: LlamaClient;
   /** Port-availability probe override (tests). Defaults to a real bind probe. */
   portProbe?: (port: number) => Promise<boolean>;
+  /** Which model GGUFs count as downloaded, for the degradation ladder.
+   *  Defaults to a real on-disk check; tests inject presence so the fallback
+   *  policy can be exercised without multi-GB files. */
+  modelPresent?: PresenceFn;
 }
 
 export class LlamaLauncher {
@@ -370,6 +779,9 @@ export class LlamaLauncher {
   /** If we fell back from Vulkan→CPU at startup, this holds the GPU init
    *  error so the UI can surface "running on CPU because <reason>". */
   private backendWarning: string | null = null;
+  /** A user-actionable next step when the launcher cannot recover on its own
+   *  (currently: no CPU-capable model downloaded). Cleared on any ready launch. */
+  private action: LauncherAction | null = null;
 
   constructor(private readonly opts: LauncherOptions = {}) {}
 
@@ -392,6 +804,7 @@ export class LlamaLauncher {
     error: string | null;
     backendMode: BackendMode;
     backendWarning: string | null;
+    action: LauncherAction | null;
   } {
     const external = Boolean(this.opts.externalUrl ?? process.env.LLAMA_SERVER_URL);
     return {
@@ -402,6 +815,7 @@ export class LlamaLauncher {
       error: this.lastError,
       backendMode: this.backendMode,
       backendWarning: this.backendWarning,
+      action: this.action,
     };
   }
 
@@ -494,40 +908,73 @@ export class LlamaLauncher {
     if (attempt.status === "ready") {
       this.backendMode = profile.nGpuLayers > 0 ? "vulkan" : "cpu";
       this.backendWarning = null;
+      this.action = null;
       return attempt;
     }
 
-    // Attempt failed. If we asked for GPU offload AND the failure looks
-    // like a backend-init problem (no Vulkan device, driver missing, etc.),
-    // retry once with nGpuLayers=0 so the user gets a working CPU fallback
-    // instead of a hard "error" status.
+    // The attempt failed. Two failures are recoverable, and they need
+    // different responses:
     //
-    // Critical: when falling back to CPU, also reset the knobs that were
-    // tuned for the GPU path:
-    //   - nThreads: was lowered to 4 for GPU (host-side only). On CPU,
-    //     every layer's matmul runs on threads, so use all available cores.
-    //   - specType: MTP draft heads add work-per-step that's only a win
-    //     when GPU compute is fast enough to keep up. On CPU, the draft
-    //     compute usually costs more than it saves; disable it.
-    const isBackendFailure = profile.nGpuLayers > 0 && isVulkanInitFailure(attempt.errorTail ?? "");
-    if (isBackendFailure) {
-      const reason = extractBackendFailureReason(attempt.errorTail ?? "");
-      const cpuProfile: LlamaProfile = {
-        ...profile,
-        nGpuLayers: 0,
-        nThreads: cpus().length,
-        specType: "none",
-      };
-      const second = await this.attemptStart(bin, cpuProfile);
-      if (second.status === "ready") {
-        this.profile = cpuProfile;
-        this.backendMode = "cpu-fallback";
-        this.backendWarning = `Vulkan unavailable (${reason}). Running on CPU.`;
-        return second;
-      }
-      return second;
+    //   - Backend init failed: there is no usable GPU at all, so no GPU rung
+    //     can help. Go straight to the CPU rung.
+    //   - Allocation failed: the GPU works but is full right now. Walk the
+    //     whole ladder, which usually lands one rung down and STILL on the GPU.
+    //
+    // Anything else (bad flag, corrupt GGUF, missing file) is not a memory
+    // problem and retrying a smaller model would only obscure it, so it is
+    // reported as-is.
+    //
+    // Order matters, and not for a subtle reason. A real allocation failure
+    // prints this, verbatim, on Vulkan:
+    //
+    //   ggml_vulkan: Device memory allocation of size 1632174080 failed.
+    //   ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory
+    //
+    // The second line ALSO satisfies isVulkanInitFailure's "ggml_vulkan.*error"
+    // pattern, because "ErrorOutOfDeviceMemory" contains "error". Testing the
+    // backend first would therefore classify every genuine OOM as "no GPU" and
+    // skip straight to the CPU — throwing away the GPU rungs that would have
+    // worked. Out-of-memory wins the tie.
+    const errorTail = attempt.errorTail ?? "";
+    const onGpu = profile.nGpuLayers > 0;
+    const outOfMemory = isOutOfMemoryFailure(errorTail);
+    const backendFailed = !outOfMemory && onGpu && isVulkanInitFailure(errorTail);
+    if (!backendFailed && !outOfMemory) return attempt;
+
+    const cause = backendFailed
+      ? `Vulkan unavailable (${extractBackendFailureReason(errorTail)}).`
+      : `Not enough memory to load ${describeProfile(profile)}.`;
+
+    // On a backend failure the GPU rungs are pointless — filter the ladder down
+    // to the CPU rung. On an allocation failure keep all of it.
+    const ladder = degradationLadder(profile, this.opts.modelPresent).filter(
+      (step) => !backendFailed || step.profile.nGpuLayers === 0,
+    );
+
+    for (const step of ladder) {
+      // eslint-disable-next-line no-console
+      console.warn(`[llama-launcher] ${cause} Falling back to ${step.label}.`);
+      const next = await this.attemptStart(bin, step.profile);
+      if (next.status !== "ready") continue;
+      this.profile = step.profile;
+      this.backendMode = step.profile.nGpuLayers > 0 ? "vulkan" : "cpu-fallback";
+      this.backendWarning = `${cause} Running ${step.label} instead.`;
+      this.action = null;
+      return next;
     }
-    return attempt;
+
+    // Ladder exhausted (or empty). If the reason we have no CPU rung is that no
+    // CPU-capable model is downloaded, say so and offer the install — that is
+    // the difference between "your assistant is broken" and one button.
+    this.status = "error";
+    if (cpuFallbackModel(this.opts.modelPresent) === null) {
+      this.action = installCpuModelAction(cause);
+      if (this.action) this.lastError = this.action.message;
+    } else {
+      this.lastError = `${cause} ${attempt.errorTail ?? ""}`.trim();
+    }
+    this.backendWarning = null;
+    return { ...attempt, status: "error", errorTail: this.lastError ?? undefined };
   }
 
   /** Single launch attempt. Spawns the binary, polls /health until ready
@@ -645,7 +1092,7 @@ export class LlamaLauncher {
 
   async restart(profile?: LlamaProfile): Promise<LaunchResult> {
     await this.stop();
-    return this.start(profile ?? this.profile ?? defaultProfile());
+    return this.start(profile ?? this.profile ?? launchProfile());
   }
 }
 
@@ -664,11 +1111,12 @@ export class LlamaLauncher {
  * - `nParallel: 1` — single-user app. 4 slots reserves KV cache + recurrent
  *   state for parallel requests we never make. Single slot frees that
  *   memory and reduces graph complexity.
- * - `specDraftNMax: 1` — minimal MTP draft length. Qwen3.5 is a hybrid
- *   Transformer + Gated DeltaNet (SSM) architecture; the SSM layers don't
- *   speculate cleanly with longer draft chains, and Vulkan's SSM kernels
- *   are unoptimized vs CUDA. With n_max=1 the draft cost is minimal and
- *   any accepted token is pure profit.
+ * - `specDraftNMax: 2` — measured optimum, not a guess (see the table at the
+ *   value itself). The prior reasoning for 1 — that Qwen3.5's hybrid
+ *   Transformer + SSM layers would not speculate cleanly on Vulkan — was
+ *   directionally right but one step too cautious: 2 beats 1 on both models
+ *   (4B 1.44x vs 1.28x over speculation off), and only from 3 upward does the
+ *   falling accept rate stop paying for the extra draft compute.
  * - `useMmap: false` + `useMlock: true` pin the GGUF in resident RAM on the
  *   CPU fallback path (no effect when nGpuLayers > 0 — buildArgs elides them).
  *
@@ -681,8 +1129,19 @@ export class LlamaLauncher {
  * can never produce an unresolvable modelPath. The MTP self-draft (specType:
  * draft-mtp) is specific to the 2B-MTP GGUF, so non-MTP models disable it.
  */
-export function defaultProfile(modelId?: string): LlamaProfile {
+export function defaultProfile(
+  modelId?: string,
+  /** GPU reading used to decide whether MTP speculation fits. Explicit rather
+   *  than probed here so the function stays pure and testable; production goes
+   *  through launchProfile(), which probes. Omitting it keeps speculation at
+   *  the model's declared default. */
+  gpu?: GpuInfo | null,
+): LlamaProfile {
   const spec = (modelId && modelById(modelId)) || MODEL_REGISTRY[0]!;
+  const speculation =
+    gpu === undefined
+      ? { specType: spec.specType, specDraftNMax: spec.specDraftNMax }
+      : speculationFor(spec, gpu);
   return {
     // Path is resolved against the project root (where pnpm-workspace.yaml
     // lives), NOT the API's cwd — which would be apps/api/ under
@@ -697,13 +1156,19 @@ export function defaultProfile(modelId?: string): LlamaProfile {
     // llama_profiles row if you need a fixed different port.
     port: 8090,
     // 128k context. The fixed prefill alone is heavy — base system
-    // instructions + workspace summary + the FULL tool registry (~5–7k tokens
+    // instructions + workspace summary + the FULL tool registry (~5-7k tokens
     // of name/description/input-schema serialized by Qwen's chat template every
-    // turn) — and we want generous room for long multi-turn sessions. 128k f16
-    // KV-cache is ~6.4 GB extra over the 8k baseline on our Vulkan path (double
-    // 64k); on VRAM-tight machines this can fail to allocate and fall back to
-    // CPU (slow) or refuse — watch the launch log for a KV-alloc / OOM failure
-    // and dial back if so. Qwen3.5's native context comfortably exceeds 128k.
+    // turn) — and we want generous room for long multi-turn sessions.
+    //
+    // 128k is affordable here only because qwen35 is a HYBRID: full attention
+    // runs every 4th layer (full_attention_interval=4) and the rest are SSM
+    // layers whose state is constant in context length. Only the attention
+    // layers hold a KV cache, so at 128k f16 that is 1.75 GiB on the 2B (7 such
+    // layers, incl. the MTP layer) and 4.5 GiB on the 4B (9). A dense model of
+    // the same depth would want ~16 GiB and simply would not fit. On VRAM-tight
+    // machines allocation can still fail and fall back to CPU (slow) — watch
+    // the launch log for a KV-alloc / OOM failure and dial back if so.
+    // Qwen3.5's native context (262144) comfortably exceeds 128k.
     // Must stay in sync with chat.ts CONTEXT_BUDGET_TOKENS.
     ctxSize: 131072,
     nGpuLayers: 99,
@@ -715,16 +1180,49 @@ export function defaultProfile(modelId?: string): LlamaProfile {
     nThreads: 4,
     batchSize: 512,
     flashAttn: true,
-    // KV cache type-k and type-v are left at llama-server's f16 default
-    // (no --cache-type-k / --cache-type-v passed). Quantizing KV (q8_0,
-    // q4_0) was tested and slowed things down on this Vulkan + small-model
-    // path because the dequant cost beat the memory-bandwidth savings.
+    // q8_0 KV cache. At 128k the cache outweighs the weights, so halving its
+    // precision is the largest VRAM saving available that does not cut context:
+    //   4B   8,351 -> 6,183 MiB  (-2,168)
+    //   2B   3,590 -> 2,750 MiB    (-840)
+    //
+    // And it is FREE. Measured 4 prompts x 3 reps per cell (n=12), f16 vs q8_0,
+    // speculation on and off, as q8/f16 throughput ratios:
+    //   2B  spec-off 1.04x   spec-on 1.04x
+    //   4B  spec-off 0.98x   spec-on 0.99x
+    // No consistent direction and nothing outside run-to-run noise. Draft
+    // acceptance is unchanged too (2B 69.3% -> 67.7%, 4B 75.1% -> 74.4%), which
+    // says the quantized cache is not measurably perturbing the model's own
+    // predictions — the dequant cost and the bandwidth saving cancel.
+    //
+    // (An earlier n=4 run suggested the 2B lost 16% here. That did not survive
+    // more samples; do not re-derive the setting from small runs.)
+    cacheType: "q8_0",
     useMmap: false,
     useMlock: true,
-    // Per-model: the 2B-MTP build self-drafts via packed MTP heads; the 4B
-    // GGUF has none, so it declares "none" and runs without speculation.
-    specType: spec.specType,
-    specDraftNMax: 1,
+    // Per-model: both registry builds are MTP GGUFs and self-draft via packed
+    // MTP heads (the extra nextn layer is the last block in each file). Whether
+    // speculation is actually ON also depends on free VRAM — see speculationFor.
+    specType: speculation.specType,
+    // Per-model (spec.specDraftNMax). MEASURED under this exact config — q8_0
+    // KV, 128k — as interleaved A/B blocks rather than one ascending sweep,
+    // because an ascending sweep confounds the setting with anything that
+    // drifts over a session. Medians of 12 samples per block, tok/s:
+    //
+    //   4B   off 94.9 | n2 133.7 | n3 137.7 | n6 101.3        -> peak 3 (1.45x)
+    //   2B   off  187 | n2 210.5 | n6 262.8 | n8 265.8
+    //                 | n12 261.0 | n16 189.4                 -> peak 8 (1.42x)
+    //
+    // The two models want wildly different depths, which is why this moved onto
+    // the registry entry. The 4B's verify batch is expensive enough that depth
+    // stops paying at 3; the 2B is cheap enough per pass to keep winning out to
+    // a plateau around 6-12. Both collapse once the accept rate craters (2B at
+    // n16: 33.7%).
+    //
+    // Two traps recorded so the next person does not re-learn them: an earlier
+    // f16 sweep put both models at 2, so this MUST be re-measured if the KV
+    // type changes; and 0 is not a legal value — llama-server exits at startup,
+    // so "off" is specType "none".
+    specDraftNMax: speculation.specDraftNMax,
     nParallel: 1,
     // Qwen3.5 recommended sampler settings for "precise coding" / agentic
     // tool-calling workloads (per unsloth's published guidance).
@@ -741,6 +1239,15 @@ export function defaultProfile(modelId?: string): LlamaProfile {
     // Mirrored by chat.ts REPLY_RESERVATION_TOKENS and the per-request max_tokens.
     maxTokens: 16384,
   };
+}
+
+/**
+ * The profile production actually launches with: defaultProfile plus a real GPU
+ * reading, so a VRAM-tight machine runs without speculation instead of failing
+ * to allocate and falling all the way back to CPU.
+ */
+export function launchProfile(modelId?: string): LlamaProfile {
+  return defaultProfile(modelId, detectGpu());
 }
 
 /** Heuristic: does the stderr tail show a Vulkan/GPU init failure that
@@ -761,6 +1268,40 @@ export function isVulkanInitFailure(stderr: string): boolean {
     /failed\s+to\s+load\s+vulkan/,
     /ggml_vulkan.*error/,
     /unable\s+to\s+find\s+vulkan\s+loader/,
+  ];
+  return hits.some((re) => re.test(s));
+}
+
+/**
+ * Heuristic: did the launch fail because something could not be ALLOCATED?
+ *
+ * Distinct from isVulkanInitFailure on purpose. That one means "there is no
+ * usable GPU", and the only sane response is the CPU. This one means "the GPU
+ * is fine, it just does not have room right now", and the response is to step
+ * down one rung of the ladder — which usually still lands on the GPU.
+ *
+ * Covers the three places llama.cpp reports it: the backend allocator, the KV
+ * cache init, and the raw Vulkan/CUDA driver error underneath both.
+ */
+export function isOutOfMemoryFailure(stderr: string): boolean {
+  if (!stderr) return false;
+  const s = stderr.toLowerCase();
+  const hits = [
+    /out\s+of\s+(device\s+|host\s+)?memory/,
+    /erroroutofdevicememory/,
+    /erroroutofhostmemory/,
+    /vk_error_out_of_\w+_memory/,
+    /failed\s+to\s+allocate/,
+    /allocation\s+of\s+size\s+\d+\s+failed/,
+    /unable\s+to\s+allocate/,
+    /cannot\s+allocate/,
+    /failed\s+to\s+reserve\s+(a\s+)?buffer/,
+    /ggml_backend_\w*alloc\w*.*fail/,
+    /kv[\s_-]?cache.*(failed|could\s+not).*(alloc|creat)/,
+    /(failed|could\s+not).*alloc.*kv[\s_-]?cache/,
+    /insufficient\s+(device\s+)?memory/,
+    /cudamalloc\s+failed/,
+    /std::bad_alloc/,
   ];
   return hits.some((re) => re.test(s));
 }

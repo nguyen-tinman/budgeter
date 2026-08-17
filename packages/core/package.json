@@ -25,6 +25,10 @@
     "./money": {
       "types": "./dist/money.d.ts",
       "import": "./dist/money.js"
+    },
+    "./custom_page": {
+      "types": "./dist/custom_page.d.ts",
+      "import": "./dist/custom_page.js"
     }
   },
   "scripts": {

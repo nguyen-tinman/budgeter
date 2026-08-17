@@ -42,11 +42,16 @@ export const MODEL_DIGESTS: Record<string, PinnedDigest> = {
     sizeBytes: 1_433_013_664,
     source: "huggingface.co/unsloth/Qwen3.5-2B-MTP-GGUF LFS pointer (raw/main), 2026-06-10",
   },
-  // qwen3.5-4b (MODEL_REGISTRY id) — larger optional model.
-  "Qwen3.5-4B-UD-Q5_K_XL.gguf": {
-    sha256: "b4c36a8e14a80c21bcab5a067ce342b2e70e28f60b4aa95ad12203fa17b87426",
-    sizeBytes: 3_250_869_408,
-    source: "huggingface.co/unsloth/Qwen3.5-4B-GGUF LFS pointer (raw/main), 2026-06-10",
+  // qwen3.5-4b (MODEL_REGISTRY id) — larger model, MTP self-draft build.
+  //
+  // Upstream publishes the SAME filename in the plain and MTP repos, so the
+  // local basename carries "MTP" to keep the two from colliding on disk; the
+  // key here is that local name, while the digest is the MTP repo's file.
+  "Qwen3.5-4B-MTP-UD-Q5_K_XL.gguf": {
+    sha256: "d76bf69a16f1d59f8d6c74a7373c41e43e14dc7ab47901cc2504c7ad647c6ba6",
+    sizeBytes: 3_304_827_200,
+    source:
+      "huggingface.co/unsloth/Qwen3.5-4B-MTP-GGUF LFS pointer (raw/main/Qwen3.5-4B-UD-Q5_K_XL.gguf), 2026-08-14",
   },
 };
 

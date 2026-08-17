@@ -15,7 +15,11 @@ import {
   modelById,
   modelPathFor,
   MODEL_REGISTRY,
+  parseDeviceList,
+  chooseSetupModel,
+  GPU_VRAM_MIB_FOR_LARGE_MODEL,
   type ModelSpec,
+  type GpuInfo,
 } from "../src/services/llama_launcher.js";
 import type { AppSettingsRepo } from "@budgetkit/db";
 import { pickAsset, type Release } from "../src/services/llama_updater.js";
@@ -43,6 +47,17 @@ describe("llama_launcher — buildArgs (pure)", () => {
     expect(args).toContain("-fa");
   });
 
+  it("always pins --jinja and --reasoning-format auto (tool calling depends on them)", () => {
+    // Tool calling only works on llama-server's Jinja chat-template path.
+    // Current builds default to it, but the binary floats on "latest"
+    // releases, so an upstream default flip would silently kill tool calls.
+    const args = buildArgs(defaultProfile());
+    expect(args).toContain("--jinja");
+    const i = args.indexOf("--reasoning-format");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(args[i + 1]).toBe("auto");
+  });
+
   it("omits --no-mmap / --mlock when nGpuLayers > 0 (GPU path)", () => {
     const args = buildArgs({
       ...defaultProfile(),
@@ -54,7 +69,10 @@ describe("llama_launcher — buildArgs (pure)", () => {
     expect(args).not.toContain("--mlock");
   });
 
-  it("includes --no-mmap / --mlock when nGpuLayers === 0 (CPU path)", () => {
+  it("includes --no-mmap on the CPU path, and --mlock only off Windows", () => {
+    // --mlock aborts llama-server on Windows (llama-mmap.cpp GGML_ASSERT(addr),
+    // reproduced at 8k and 128k with 27 GB free), which made the CPU fallback
+    // crash every time on the platform this app primarily targets.
     const args = buildArgs({
       ...defaultProfile(),
       nGpuLayers: 0,
@@ -62,7 +80,11 @@ describe("llama_launcher — buildArgs (pure)", () => {
       useMlock: true,
     });
     expect(args).toContain("--no-mmap");
-    expect(args).toContain("--mlock");
+    if (process.platform === "win32") {
+      expect(args).not.toContain("--mlock");
+    } else {
+      expect(args).toContain("--mlock");
+    }
   });
 });
 
@@ -1024,5 +1046,76 @@ describe("C5 — llama_updater verifies the GitHub release asset digest", () => 
     } finally {
       env.fs.rmSync(env.dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// First-run model choice. The policy is a pure function of a GPU reading so it
+// can be exercised on machines with no GPU at all — including CI.
+// ---------------------------------------------------------------------------
+
+describe("llama_launcher — GPU detection + setup default", () => {
+  const large = MODEL_REGISTRY.reduce((a, b) => (b.sizeRank > a.sizeRank ? b : a));
+  const small = MODEL_REGISTRY.reduce((a, b) => (b.sizeRank < a.sizeRank ? b : a));
+
+  it("parses the device list llama-server actually prints", () => {
+    const out = [
+      "ggml_vulkan: Found 1 Vulkan devices:",
+      "Available devices:",
+      "  Vulkan0: NVIDIA GeForce RTX 5060 Ti (15962 MiB, 15194 MiB free)",
+    ].join("\n");
+    expect(parseDeviceList(out)).toEqual([
+      { name: "NVIDIA GeForce RTX 5060 Ti", totalMiB: 15962, freeMiB: 15194 },
+    ]);
+  });
+
+  it("returns nothing when no device lines are present", () => {
+    expect(parseDeviceList("Available devices:\n(none)\n")).toEqual([]);
+  });
+
+  it("downloads the smaller model when there is no GPU", () => {
+    const choice = chooseSetupModel(null);
+    expect(choice.modelId).toBe(small.id);
+    expect(choice.reason).toMatch(/no gpu/i);
+  });
+
+  it("downloads the smaller model on a small GPU", () => {
+    const gpu: GpuInfo = { name: "Intel Iris Xe", totalMiB: 4096, freeMiB: 3800 };
+    const choice = chooseSetupModel(gpu);
+    expect(choice.modelId).toBe(small.id);
+    // The band where 4B weights fit but a full-context KV cache would not is
+    // exactly the case a naive "does it fit on disk" check gets wrong.
+    expect(choice.reason).toContain("Intel Iris Xe");
+  });
+
+  it("downloads the larger model once there is real headroom", () => {
+    const gpu: GpuInfo = { name: "NVIDIA GeForce RTX 5060 Ti", totalMiB: 15962, freeMiB: 15194 };
+    const choice = chooseSetupModel(gpu);
+    expect(choice.modelId).toBe(large.id);
+    expect(choice.reason).toContain(large.label);
+  });
+
+  it("treats the threshold itself as sufficient", () => {
+    const at: GpuInfo = { name: "GPU", totalMiB: 8192, freeMiB: GPU_VRAM_MIB_FOR_LARGE_MODEL };
+    const below: GpuInfo = { ...at, freeMiB: GPU_VRAM_MIB_FOR_LARGE_MODEL - 1 };
+    expect(chooseSetupModel(at).modelId).toBe(large.id);
+    expect(chooseSetupModel(below).modelId).toBe(small.id);
+  });
+
+  it("runs both registry models with MTP self-draft speculation", () => {
+    for (const spec of MODEL_REGISTRY) {
+      expect(spec.specType).toBe("draft-mtp");
+      const args = buildArgs({ ...defaultProfile(spec.id), modelPath: "/m.gguf" });
+      expect(args).toContain("--spec-type");
+      expect(args[args.indexOf("--spec-type") + 1]).toBe("draft-mtp");
+    }
+  });
+
+  it("gives the MTP 4B its own filename so a plain 4B is never mistaken for it", () => {
+    // Both upstream repos publish UD-Q5_K_XL under the same name; sharing it
+    // would let a headless GGUF be launched with --spec-type draft-mtp.
+    const names = MODEL_REGISTRY.map((m) => m.fileName);
+    expect(new Set(names).size).toBe(names.length);
+    expect(large.fileName).toContain("MTP");
   });
 });

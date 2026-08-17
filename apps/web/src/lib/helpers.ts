@@ -76,7 +76,7 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
   },
   "fica": {
     title: "FICA",
-    body: "Federal Insurance Contributions Act — payroll tax that funds Social Security (6.2%) and Medicare (1.45%). Applied to taxed-W2 income, not pretax 401k or HSA contributions.",
+    body: "Federal Insurance Contributions Act — payroll tax that funds Social Security (6.2%) and Medicare (1.45%). Applied to taxed‑W2 income, not pretax 401k or HSA contributions.",
     immediate: "grossTaxedIncome × (0.062 + 0.0145) = grossTaxedIncome × 0.0765",
     final: "incomes.taxStatus='taxed' grossAnnualDollars",
   },
@@ -120,7 +120,7 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
   },
   "gross-taxed-annual": {
     title: "Annual gross (taxed)",
-    body: "Annual W-2 / 1099 wages before any deductions — the base the bracket math is applied to.",
+    body: "Annual W‑2 / 1099 wages before any deductions — the base the bracket math is applied to.",
     immediate: "Σ income.grossAnnualDollars where taxStatus='taxed'",
     final: "incomes table — rows tagged 'taxed' for this workspace",
   },
@@ -256,7 +256,7 @@ export const HELP_TOPICS: Record<string, HelpTopic> = {
     title: "Sensitivity grid",
     body: "Monthly remaining across a 5×5 sweep of primary × spouse annual gross. Red cells mean expenses outpace take-home at that mix.",
     immediate: "For each (primaryGross, spouseGross): computeTakeHome([primary, spouse, …pretax]) − monthlyExpenseTotal",
-    final: "expenses + pretax incomes + tax_tables for the active workspace; W-2 incomes are swapped at each grid point",
+    final: "expenses + pretax incomes + tax_tables for the active workspace; W‑2 incomes are swapped at each grid point",
   },
 
   // ── Retirement ──────────────────────────────────────────────────────

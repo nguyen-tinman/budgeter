@@ -26,6 +26,20 @@ import {
 // In-memory repository fakes — let the registry's invariants be tested
 // independently from SQLite.
 
+type TaxSettingsRow = ReturnType<TaxRepo["settingsForWorkspace"]>;
+
+/** What every workspace's tax settings look like until a test overwrites or
+ *  deletes them. Mirrors the values seeded by migration 001. */
+const DEFAULT_TAX_SETTINGS: TaxSettingsRow = {
+  filing: "single",
+  taxYear: 2025,
+  caSdiRate: 0.011,
+  ssWageBaseDollars: 176100,
+  ficaSsRate: 0.062,
+  ficaMedicareRate: 0.0145,
+  retirementEffectiveTaxRate: 0.12,
+};
+
 function mkMemoryCtx(): ToolCtx & {
   audit: AuditLogRepo & { records: ToolCallRecord[] };
   __txnRows: Array<{ monthKey: string; categoryId: number | null; totalDollars: number }>;
@@ -47,6 +61,7 @@ function mkMemoryCtx(): ToolCtx & {
     sourceAccount: string;
     ignored: boolean;
   }>;
+  __deleteTaxSettings: (workspaceId: number) => void;
 } {
   let nextWsId = 1;
   let nextExpId = 1;
@@ -208,6 +223,8 @@ function mkMemoryCtx(): ToolCtx & {
     },
   };
 
+  const taxOverrides = new Map<number, TaxSettingsRow>();
+  const deletedTaxSettings = new Set<number>();
   const taxRepo: TaxRepo = {
     tables: (year) => [
       {
@@ -277,15 +294,40 @@ function mkMemoryCtx(): ToolCtx & {
         ],
       },
     ],
-    settingsForWorkspace: () => ({
-      filing: "single",
-      taxYear: 2025,
-      caSdiRate: 0.011,
-      ssWageBaseDollars: 176100,
-      ficaSsRate: 0.062,
-      ficaMedicareRate: 0.0145,
-      retirementEffectiveTaxRate: 0.12,
-    }),
+    // Every workspace has settings by default (DEFAULT_TAX_SETTINGS) unless a
+    // test removes them via __deleteTaxSettings; per-workspace writes are kept
+    // in `taxOverrides` so a partial update_tax_settings is observable.
+    settingsForWorkspace: (workspaceId) => {
+      if (deletedTaxSettings.has(workspaceId)) {
+        throw new Error(
+          `No tax_settings row for workspace ${workspaceId}. Create one with the update_tax_settings tool or the Setup page.`,
+        );
+      }
+      return { ...(taxOverrides.get(workspaceId) ?? DEFAULT_TAX_SETTINGS) };
+    },
+    setSettingsForWorkspace: (args) => {
+      const { workspaceId, ...fields } = args;
+      const supplied = Object.entries(fields).filter(([, v]) => v !== undefined);
+      if (!deletedTaxSettings.has(workspaceId)) {
+        if (supplied.length === 0) return { saved: false, created: false };
+        taxOverrides.set(workspaceId, {
+          ...(taxOverrides.get(workspaceId) ?? DEFAULT_TAX_SETTINGS),
+          ...(Object.fromEntries(supplied) as Partial<TaxSettingsRow>),
+        });
+        return { saved: true, created: false };
+      }
+      if (fields.filing === undefined || fields.taxYear === undefined) {
+        throw new Error(
+          `No tax_settings row exists for workspace ${workspaceId}; creating one requires both "filing" and "taxYear".`,
+        );
+      }
+      deletedTaxSettings.delete(workspaceId);
+      taxOverrides.set(workspaceId, {
+        ...DEFAULT_TAX_SETTINGS,
+        ...(Object.fromEntries(supplied) as Partial<TaxSettingsRow>),
+      });
+      return { saved: true, created: true };
+    },
     upsertTable: () => ({ saved: true }),
   };
 
@@ -531,6 +573,152 @@ function mkMemoryCtx(): ToolCtx & {
           postedDate: t.postedDate,
           amountDollars: t.amountDollars,
         })),
+    listChargeRowsInRange: (from, to) =>
+      insertedTxns
+        .filter(
+          (t) =>
+            t.amountDollars < 0 &&
+            (from === undefined || t.postedDate >= from) &&
+            (to === undefined || t.postedDate <= to),
+        )
+        .map((t) => ({
+          merchantRaw: t.merchantRaw,
+          merchantNormalized: t.merchantNormalized,
+          postedDate: t.postedDate,
+          amountDollars: t.amountDollars,
+          categoryId: t.categoryId,
+          accountType: t.accountType,
+        })),
+    search: (args) => {
+      const needle = args.merchant?.toLowerCase();
+      const matched = insertedTxns.filter((t) => {
+        if (args.includeCredits !== true && t.amountDollars >= 0) return false;
+        if (
+          needle !== undefined &&
+          needle !== "" &&
+          !t.merchantNormalized.toLowerCase().includes(needle) &&
+          !t.merchantRaw.toLowerCase().includes(needle)
+        ) {
+          return false;
+        }
+        if (args.from !== undefined && t.postedDate < args.from) return false;
+        if (args.to !== undefined && t.postedDate > args.to) return false;
+        if (args.categoryId !== undefined && t.categoryId !== args.categoryId) return false;
+        const abs = Math.abs(t.amountDollars);
+        if (args.minAmountDollars !== undefined && abs < args.minAmountDollars) return false;
+        if (args.maxAmountDollars !== undefined && abs > args.maxAmountDollars) return false;
+        return true;
+      });
+      // posted_date DESC, id DESC — reverse first so the stable sort leaves
+      // same-date rows newest-inserted-first, matching the SQL ORDER BY.
+      const ordered = matched.slice().reverse().sort((a, b) => b.postedDate.localeCompare(a.postedDate));
+      const page = ordered.slice(args.offset, args.offset + args.limit);
+      return {
+        rows: page.map((t) => ({
+          postedDate: t.postedDate,
+          merchantRaw: t.merchantRaw,
+          merchantNormalized: t.merchantNormalized,
+          amountDollars: round2(t.amountDollars),
+          categoryId: t.categoryId,
+          accountType: t.accountType,
+        })),
+        totalMatched: matched.length,
+      };
+    },
+    topMerchants: (args) => {
+      const groups = new Map<
+        string,
+        {
+          merchantNormalized: string;
+          merchantRawSample: string;
+          txnCount: number;
+          totalDollars: number;
+          firstSeen: string;
+          lastSeen: string;
+        }
+      >();
+      for (const t of insertedTxns) {
+        if (t.amountDollars >= 0) continue; // charges only
+        if (args.from !== undefined && t.postedDate < args.from) continue;
+        if (args.to !== undefined && t.postedDate > args.to) continue;
+        if (args.categoryId !== undefined && t.categoryId !== args.categoryId) continue;
+        const g = groups.get(t.merchantNormalized) ?? {
+          merchantNormalized: t.merchantNormalized,
+          merchantRawSample: t.merchantRaw,
+          txnCount: 0,
+          totalDollars: 0,
+          firstSeen: t.postedDate,
+          lastSeen: t.postedDate,
+        };
+        g.txnCount += 1;
+        g.totalDollars += -t.amountDollars;
+        if (t.merchantRaw < g.merchantRawSample) g.merchantRawSample = t.merchantRaw; // MIN()
+        if (t.postedDate < g.firstSeen) g.firstSeen = t.postedDate;
+        if (t.postedDate > g.lastSeen) g.lastSeen = t.postedDate;
+        groups.set(t.merchantNormalized, g);
+      }
+      return [...groups.values()]
+        .map((g) => ({ ...g, totalDollars: round2(g.totalDollars) }))
+        .sort((a, b) => b.totalDollars - a.totalDollars)
+        .slice(0, args.limit);
+    },
+    aggregate: (args) => {
+      const matched = insertedTxns.filter((t) => {
+        if (args.includeCredits !== true && t.amountDollars >= 0) return false;
+        if (args.from !== undefined && t.postedDate < args.from) return false;
+        if (args.to !== undefined && t.postedDate > args.to) return false;
+        if (args.categoryId !== undefined && t.categoryId !== args.categoryId) return false;
+        if (args.dayOfWeek !== undefined) {
+          // Date-only string → UTC parse keeps this timezone-free, matching
+          // SQLite's strftime('%w', posted_date).
+          if (new Date(`${t.postedDate}T00:00:00Z`).getUTCDay() !== args.dayOfWeek) return false;
+        }
+        return true;
+      });
+      const keyOf = (t: (typeof insertedTxns)[number]): string => {
+        switch (args.groupBy) {
+          case "day":
+            return t.postedDate;
+          case "week": {
+            const d = new Date(`${t.postedDate}T00:00:00Z`);
+            d.setUTCDate(d.getUTCDate() - d.getUTCDay()); // Sunday-start week key
+            return d.toISOString().slice(0, 10);
+          }
+          case "month":
+            return t.postedDate.slice(0, 7);
+          case "dayOfWeek":
+            return String(new Date(`${t.postedDate}T00:00:00Z`).getUTCDay());
+          case "category":
+            return t.categoryId === null ? "uncat" : String(t.categoryId);
+          default:
+            return t.merchantNormalized;
+        }
+      };
+      const groups = new Map<string, { key: string; sum: number; count: number }>();
+      for (const t of matched) {
+        const key = keyOf(t);
+        const g = groups.get(key) ?? { key, sum: 0, count: 0 };
+        g.sum += -t.amountDollars;
+        g.count += 1;
+        groups.set(key, g);
+      }
+      const ordered = [...groups.values()].sort((a, b) =>
+        args.groupBy === "category" || args.groupBy === "merchant"
+          ? b.sum - a.sum
+          : a.key.localeCompare(b.key),
+      );
+      return {
+        rows: ordered.slice(0, args.limit).map((g) => ({
+          key: g.key,
+          value:
+            args.metric === "count"
+              ? g.count
+              : round2(args.metric === "avg" ? g.sum / g.count : g.sum),
+          count: g.count,
+        })),
+        totalGroups: ordered.length,
+      };
+    },
     totalCount: () => txnRows.length + insertedTxns.length,
     insertMany: (importId, rows) => {
       for (const r of rows) insertedTxns.push({ importId, ...r });
@@ -579,6 +767,45 @@ function mkMemoryCtx(): ToolCtx & {
     },
   };
 
+  // In-memory CustomPageRepo with the same "blank = absent" + snapshot
+  // semantics as the SQLite one (packages/db/src/repositories.ts).
+  const customPageRows = new Map<string, { value: string; updatedAt: string }>();
+  const customPage: ToolCtx["customPage"] = {
+    read: () => {
+      const row = customPageRows.get("def");
+      return row ? { definitionJson: row.value, updatedAt: row.updatedAt } : null;
+    },
+    readPrev: () => {
+      const row = customPageRows.get("prev");
+      return row ? { definitionJson: row.value } : null;
+    },
+    write: (definitionJson) => {
+      const current = customPageRows.get("def");
+      if (current) customPageRows.set("prev", { ...current });
+      else customPageRows.delete("prev");
+      const updatedAt = new Date().toISOString();
+      customPageRows.set("def", { value: definitionJson, updatedAt });
+      return { updatedAt };
+    },
+    reset: () => {
+      const current = customPageRows.get("def");
+      if (!current) return { hadDefinition: false };
+      customPageRows.set("prev", { ...current });
+      customPageRows.delete("def");
+      return { hadDefinition: true };
+    },
+    revert: () => {
+      const prev = customPageRows.get("prev");
+      if (!prev) return { reverted: false, updatedAt: null };
+      const current = customPageRows.get("def");
+      if (current) customPageRows.set("prev", { ...current });
+      else customPageRows.delete("prev");
+      const updatedAt = new Date().toISOString();
+      customPageRows.set("def", { value: prev.value, updatedAt });
+      return { reverted: true, updatedAt };
+    },
+  };
+
   return {
     audit,
     workspaces: workspaceRepo,
@@ -591,6 +818,7 @@ function mkMemoryCtx(): ToolCtx & {
     categories,
     transactions,
     statementImports,
+    customPage,
     web,
     source: "api_direct",
     // Synchronous passthrough — the in-memory fakes don't need a real
@@ -602,12 +830,19 @@ function mkMemoryCtx(): ToolCtx & {
     __insertedTxns: insertedTxns,
     __statementImportRows: statementImportRows,
     __expenseRows: expenses,
+    // Remove a workspace's tax_settings row, so settingsForWorkspace throws and
+    // update_tax_settings takes its CREATE branch.
+    __deleteTaxSettings: (workspaceId: number) => {
+      deletedTaxSettings.add(workspaceId);
+      taxOverrides.delete(workspaceId);
+    },
   } as ToolCtx & {
     audit: AuditLogRepo & { records: ToolCallRecord[] };
     __txnRows: typeof txnRows;
     __insertedTxns: typeof insertedTxns;
     __statementImportRows: typeof statementImportRows;
     __expenseRows: typeof expenses;
+    __deleteTaxSettings: (workspaceId: number) => void;
   };
 }
 
@@ -1546,6 +1781,85 @@ describe("ToolRegistry — invocation + audit", () => {
     expect(result.preTaxAtRetirementDollars).toBeLessThan(2600000);
     // After-tax must be less than pre-tax (Trad lane gets taxed)
     expect(result.afterTaxAtRetirementDollars).toBeLessThan(result.preTaxAtRetirementDollars);
+  });
+
+  it("compute_retirement: a %-of-salary account scales against its OWNING filer's salary", async () => {
+    // Dual earner with deliberately unequal salaries so the two bases can't be
+    // confused: primary $100k, spouse $200k.
+    await registry.invoke(
+      "add_income",
+      {
+        workspaceId: 1,
+        label: "Primary Salary",
+        grossAnnualDollars: 100_000,
+        taxStatus: "taxed",
+        filingRole: "primary",
+      },
+      ctx,
+    );
+    await registry.invoke(
+      "add_income",
+      {
+        workspaceId: 1,
+        label: "Spouse Salary",
+        grossAnnualDollars: 200_000,
+        taxStatus: "taxed",
+        filingRole: "spouse",
+      },
+      ctx,
+    );
+    await registry.invoke(
+      "set_retirement_settings",
+      {
+        workspaceId: 1,
+        currentAge: 30,
+        retirementAge: 65,
+        initialBalanceDollars: 0,
+        growthRate: 0.07,
+        rothSplitPct: 0.5,
+      },
+      ctx,
+    );
+    // 10% of the SPOUSE's $200k, not 10% of the primary's $100k. The monthly
+    // figure is rounded to the cent before annualizing, so $200k × 10% / 12 =
+    // $1,666.67/mo → $20,000.04/yr. Keying off the primary would give $9,999.96.
+    await registry.invoke(
+      "add_savings",
+      {
+        workspaceId: 1,
+        label: "Spouse 401k",
+        accountType: "traditional_401k",
+        contributionPctOfSalary: 0.1,
+        filingRole: "spouse",
+      },
+      ctx,
+    );
+    const spouseOnly = (await registry.invoke(
+      "compute_retirement",
+      { workspaceId: 1 },
+      ctx,
+    )) as { annualContributionDollars: number };
+    expect(spouseOnly.annualContributionDollars).toBe(20_000.04);
+
+    // A primary-owned row still resolves against the primary's $100k: 10% is
+    // $833.33/mo → $9,999.96/yr on top, for $30,000.00 combined.
+    await registry.invoke(
+      "add_savings",
+      {
+        workspaceId: 1,
+        label: "Primary 401k",
+        accountType: "traditional_401k",
+        contributionPctOfSalary: 0.1,
+        filingRole: "primary",
+      },
+      ctx,
+    );
+    const both = (await registry.invoke(
+      "compute_retirement",
+      { workspaceId: 1 },
+      ctx,
+    )) as { annualContributionDollars: number };
+    expect(both.annualContributionDollars).toBe(30_000);
   });
 
   it("compute_retirement: errors if retirement_settings unset", async () => {
@@ -2520,5 +2834,586 @@ describe("ToolRegistry — mutation gate (requireMutationConsent)", () => {
     expect(registry.isMutating("add_expense")).toBe(true);
     expect(registry.isMutating("delete_workspace")).toBe(true);
     expect(registry.isMutating("not_a_tool")).toBe(true); // fail safe
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema hardening: `pattern` on date strings, `nullable` for explicit clears
+// ---------------------------------------------------------------------------
+
+describe("validateArgs — pattern + nullable", () => {
+  const dateSchema = { type: "string" as const, pattern: "^\\d{4}-\\d{2}-\\d{2}$" };
+
+  it("accepts a YYYY-MM-DD string and rejects other date shapes", () => {
+    expect(() => validateArgs(dateSchema, "2026-03-04")).not.toThrow();
+    expect(() => validateArgs(dateSchema, "03/04/2026")).toThrow(ToolArgError);
+    expect(() => validateArgs(dateSchema, "last Tuesday")).toThrow(ToolArgError);
+    expect(() => validateArgs(dateSchema, "2026-3-4")).toThrow(ToolArgError);
+  });
+
+  it("is a FORMAT check only — an impossible calendar date still passes", () => {
+    expect(() => validateArgs(dateSchema, "2025-13-45")).not.toThrow();
+  });
+
+  it("accepts null only where nullable is set", () => {
+    expect(() => validateArgs({ type: "integer", nullable: true }, null)).not.toThrow();
+    expect(() => validateArgs({ type: "integer" }, null)).toThrow(ToolArgError);
+    // nullable does not weaken the non-null path.
+    expect(() => validateArgs({ type: "integer", nullable: true }, "7")).toThrow(ToolArgError);
+  });
+
+  it("rejects a null on add_expense.categoryId (omission means auto-categorize)", async () => {
+    const ctx = mkMemoryCtx();
+    const registry = new ToolRegistry(ALL_TOOLS);
+    await expect(
+      registry.invoke(
+        "add_expense",
+        { workspaceId: 1, label: "X", amountDollars: 5, frequency: "monthly", categoryId: null },
+        ctx,
+      ),
+    ).rejects.toThrow(ToolArgError);
+  });
+
+  it("update_expense accepts null to CLEAR categoryId and spendDate", async () => {
+    const ctx = mkMemoryCtx();
+    const registry = new ToolRegistry(ALL_TOOLS);
+    const { id } = (await registry.invoke(
+      "add_expense",
+      {
+        workspaceId: 1,
+        label: "Sofa",
+        amountDollars: 500,
+        frequency: "one_time",
+        spendDate: "2026-02-01",
+        categoryId: 4,
+      },
+      ctx,
+    )) as { id: number };
+    expect(ctx.expenses.list(1).find((e) => e.id === id)!.categoryId).toBe(4);
+
+    await registry.invoke("update_expense", { id, categoryId: null, spendDate: null }, ctx);
+    const row = ctx.expenses.list(1).find((e) => e.id === id)!;
+    expect(row.categoryId).toBeNull();
+    expect(row.spendDate).toBeNull();
+  });
+
+  it("rejects a malformed spendDate on add_expense", async () => {
+    const ctx = mkMemoryCtx();
+    const registry = new ToolRegistry(ALL_TOOLS);
+    await expect(
+      registry.invoke(
+        "add_expense",
+        { workspaceId: 1, label: "X", amountDollars: 5, frequency: "one_time", spendDate: "March 4th" },
+        ctx,
+      ),
+    ).rejects.toThrow(ToolArgError);
+  });
+});
+
+describe("employer-match fraction guard", () => {
+  let ctx: ReturnType<typeof mkMemoryCtx>;
+  let registry: ToolRegistry;
+  beforeEach(() => {
+    ctx = mkMemoryCtx();
+    registry = new ToolRegistry(ALL_TOOLS);
+  });
+
+  it("rejects a percent-shaped employerMatchValue when the kind is pct_of_salary", async () => {
+    await expect(
+      registry.invoke(
+        "add_savings",
+        {
+          workspaceId: 1,
+          label: "401k",
+          accountType: "traditional_401k",
+          employerMatchKind: "pct_of_salary",
+          employerMatchValue: 5, // meant 5%, i.e. 0.05
+        },
+        ctx,
+      ),
+    ).rejects.toThrow(/0\.\.1 fraction/);
+  });
+
+  it("still allows a large flat_annual_dollars match", async () => {
+    const r = (await registry.invoke(
+      "add_savings",
+      {
+        workspaceId: 1,
+        label: "401k",
+        accountType: "traditional_401k",
+        employerMatchKind: "flat_annual_dollars",
+        employerMatchValue: 12000,
+      },
+      ctx,
+    )) as { id: number };
+    expect(r.id).toBeGreaterThan(0);
+  });
+
+  it("applies to update_savings when kind and value arrive together", async () => {
+    const { id } = (await registry.invoke(
+      "add_savings",
+      { workspaceId: 1, label: "401k", accountType: "traditional_401k" },
+      ctx,
+    )) as { id: number };
+    await expect(
+      registry.invoke(
+        "update_savings",
+        { id, employerMatchKind: "pct_of_salary", employerMatchValue: 5 },
+        ctx,
+      ),
+    ).rejects.toThrow(/0\.\.1 fraction/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// New tools: taxonomy, tax settings, budget summary, transaction queries
+// ---------------------------------------------------------------------------
+
+describe("list_categories / get_tax_settings / update_tax_settings", () => {
+  let ctx: ReturnType<typeof mkMemoryCtx>;
+  let registry: ToolRegistry;
+  beforeEach(() => {
+    ctx = mkMemoryCtx();
+    registry = new ToolRegistry(ALL_TOOLS);
+  });
+
+  it("list_categories returns the taxonomy and writes no audit row", async () => {
+    const rows = (await registry.invoke("list_categories", {}, ctx)) as Array<{
+      id: number;
+      name: string;
+      colorHex: string;
+    }>;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0]).toMatchObject({ id: 1, name: "Housing" });
+    expect(rows.every((r) => typeof r.colorHex === "string")).toBe(true);
+    expect(ctx.audit.records).toHaveLength(0);
+  });
+
+  it("get_tax_settings returns the row and writes no audit entry", async () => {
+    const s = (await registry.invoke("get_tax_settings", { workspaceId: 1 }, ctx)) as {
+      filing: string;
+      taxYear: number;
+    };
+    expect(s).toMatchObject({ filing: "single", taxYear: 2025 });
+    expect(ctx.audit.records).toHaveLength(0);
+  });
+
+  it("get_tax_settings propagates the missing-row error instead of returning null", async () => {
+    ctx.__deleteTaxSettings(1);
+    await expect(registry.invoke("get_tax_settings", { workspaceId: 1 }, ctx)).rejects.toThrow(
+      /No tax_settings row/,
+    );
+  });
+
+  it("update_tax_settings updates only the supplied fields and audits the write", async () => {
+    const r = (await registry.invoke(
+      "update_tax_settings",
+      { workspaceId: 1, taxYear: 2026 },
+      ctx,
+    )) as { saved: boolean; created: boolean };
+    expect(r).toEqual({ saved: true, created: false });
+
+    const after = (await registry.invoke("get_tax_settings", { workspaceId: 1 }, ctx)) as Record<
+      string,
+      unknown
+    >;
+    expect(after.taxYear).toBe(2026);
+    // Untouched fields keep their stored values.
+    expect(after.filing).toBe("single");
+    expect(after.caSdiRate).toBe(0.011);
+    expect(after.ficaSsRate).toBe(0.062);
+
+    // Mutating tool → exactly one audit row (get_* contributed none).
+    expect(ctx.audit.records).toHaveLength(1);
+    expect(ctx.audit.records[0]!.toolName).toBe("update_tax_settings");
+  });
+
+  it("update_tax_settings with only a workspaceId is a no-op", async () => {
+    expect(await registry.invoke("update_tax_settings", { workspaceId: 1 }, ctx)).toEqual({
+      saved: false,
+      created: false,
+    });
+  });
+
+  it("update_tax_settings creating a row requires filing AND taxYear", async () => {
+    ctx.__deleteTaxSettings(1);
+    await expect(
+      registry.invoke("update_tax_settings", { workspaceId: 1, caSdiRate: 0.02 }, ctx),
+    ).rejects.toThrow(/requires both "filing" and "taxYear"/);
+
+    const created = (await registry.invoke(
+      "update_tax_settings",
+      { workspaceId: 1, filing: "mfj", taxYear: 2026 },
+      ctx,
+    )) as { saved: boolean; created: boolean };
+    expect(created).toEqual({ saved: true, created: true });
+    const after = (await registry.invoke("get_tax_settings", { workspaceId: 1 }, ctx)) as Record<
+      string,
+      unknown
+    >;
+    expect(after).toMatchObject({ filing: "mfj", taxYear: 2026 });
+    // Omitted columns fall back to their schema defaults.
+    expect(after.ficaMedicareRate).toBe(0.0145);
+  });
+
+  it("rejects an out-of-range rate", async () => {
+    await expect(
+      registry.invoke("update_tax_settings", { workspaceId: 1, ficaSsRate: 62 }, ctx),
+    ).rejects.toThrow(ToolArgError);
+  });
+});
+
+describe("compute_budget_summary", () => {
+  let ctx: ReturnType<typeof mkMemoryCtx>;
+  let registry: ToolRegistry;
+  beforeEach(async () => {
+    ctx = mkMemoryCtx();
+    registry = new ToolRegistry(ALL_TOOLS);
+    await registry.invoke(
+      "add_expense",
+      { workspaceId: 1, label: "Rent", amountDollars: 1800, frequency: "monthly", categoryId: 1 },
+      ctx,
+    );
+    await registry.invoke(
+      "add_expense",
+      { workspaceId: 1, label: "Car insurance", amountDollars: 1200, frequency: "annually", categoryId: 7 },
+      ctx,
+    );
+    await registry.invoke(
+      "add_expense",
+      {
+        workspaceId: 1,
+        label: "Sofa",
+        amountDollars: 900,
+        frequency: "one_time",
+        spendDate: "2026-02-10",
+        categoryId: 8,
+      },
+      ctx,
+    );
+  });
+
+  it("keeps one-time spend out of the monthly run rate and annualizes at exactly 12x", async () => {
+    const r = (await registry.invoke("compute_budget_summary", { workspaceId: 1 }, ctx)) as {
+      workspaceName: string;
+      monthlyRecurringExpenseDollars: number;
+      annualRecurringExpenseDollars: number;
+      oneTimeTotalDollars: number;
+      expenseCount: number;
+      byCategory: Array<{ categoryId: number | null; categoryName: string; monthlyDollars: number; annualDollars: number; sharePct: number }>;
+    };
+    expect(r.workspaceName).toBe("Current");
+    // 1800/mo + 1200/yr → 1900/mo. The $900 one-off contributes 0.
+    expect(r.monthlyRecurringExpenseDollars).toBeCloseTo(1900, 2);
+    expect(r.annualRecurringExpenseDollars).toBeCloseTo(r.monthlyRecurringExpenseDollars * 12, 2);
+    expect(r.oneTimeTotalDollars).toBe(900);
+    expect(r.expenseCount).toBe(3);
+
+    // Sorted by monthly cost, descending; per-category annual is also 12x.
+    expect(r.byCategory[0]!).toMatchObject({ categoryId: 1, categoryName: "Housing" });
+    expect(r.byCategory[0]!.monthlyDollars).toBe(1800);
+    expect(r.byCategory[0]!.annualDollars).toBeCloseTo(21600, 2);
+    expect(r.byCategory[0]!.sharePct).toBeCloseTo((1800 / 1900) * 100, 1);
+    // The one-time row's category is present but carries no monthly cost.
+    const disc = r.byCategory.find((c) => c.categoryId === 8)!;
+    expect(disc.monthlyDollars).toBe(0);
+  });
+
+  it("reports take-home and what is left after recurring expenses", async () => {
+    await registry.invoke(
+      "add_income",
+      { workspaceId: 1, label: "Salary", grossAnnualDollars: 150000, taxStatus: "taxed" },
+      ctx,
+    );
+    const r = (await registry.invoke("compute_budget_summary", { workspaceId: 1 }, ctx)) as {
+      takeHomeAvailable: boolean;
+      monthlyTakeHomeDollars: number;
+      annualTakeHomeDollars: number;
+      monthlyRemainingDollars: number;
+      monthlyRecurringExpenseDollars: number;
+      monthlySavingsFromCashDollars: number;
+    };
+    expect(r.takeHomeAvailable).toBe(true);
+    expect(r.monthlyTakeHomeDollars).toBeGreaterThan(0);
+    expect(r.annualTakeHomeDollars).toBeGreaterThan(r.monthlyTakeHomeDollars);
+    expect(r.monthlyRemainingDollars).toBeCloseTo(
+      round2(r.monthlyTakeHomeDollars - r.monthlyRecurringExpenseDollars),
+      2,
+    );
+    // No from-cash savings accounts seeded.
+    expect(r.monthlySavingsFromCashDollars).toBe(0);
+    expect(ctx.audit.records.filter((a) => a.toolName === "compute_budget_summary")).toHaveLength(0);
+  });
+
+  it("degrades to takeHomeAvailable:false (null dollars) when tax settings are missing", async () => {
+    ctx.__deleteTaxSettings(1);
+    const r = (await registry.invoke("compute_budget_summary", { workspaceId: 1 }, ctx)) as {
+      takeHomeAvailable: boolean;
+      monthlyTakeHomeDollars: number | null;
+      annualTakeHomeDollars: number | null;
+      monthlyRemainingDollars: number | null;
+      monthlySavingsFromCashDollars: number | null;
+      monthlyRecurringExpenseDollars: number;
+    };
+    expect(r.takeHomeAvailable).toBe(false);
+    expect(r.monthlyTakeHomeDollars).toBeNull();
+    expect(r.annualTakeHomeDollars).toBeNull();
+    expect(r.monthlyRemainingDollars).toBeNull();
+    expect(r.monthlySavingsFromCashDollars).toBeNull();
+    // The expense picture still comes back.
+    expect(r.monthlyRecurringExpenseDollars).toBeCloseTo(1900, 2);
+  });
+
+  it("throws on an unknown workspace", async () => {
+    await expect(
+      registry.invoke("compute_budget_summary", { workspaceId: 4242 }, ctx),
+    ).rejects.toThrow(/not found/i);
+  });
+});
+
+describe("search_transactions / top_merchants / compute_category_baselines", () => {
+  let ctx: ReturnType<typeof mkMemoryCtx>;
+  let registry: ToolRegistry;
+
+  beforeEach(() => {
+    ctx = mkMemoryCtx();
+    registry = new ToolRegistry(ALL_TOOLS);
+    ctx.__insertedTxns.push(
+      { importId: 1, postedDate: "2026-01-05", merchantRaw: "TRADER JOE'S #123", merchantNormalized: "trader joes", amountDollars: -85.5, categoryId: 4, accountType: "chase" },
+      { importId: 1, postedDate: "2026-01-20", merchantRaw: "TRADER JOE'S #123", merchantNormalized: "trader joes", amountDollars: -114.5, categoryId: 4, accountType: "chase" },
+      { importId: 1, postedDate: "2026-02-02", merchantRaw: "SHELL OIL 4471", merchantNormalized: "shell oil", amountDollars: -60, categoryId: 5, accountType: "chase" },
+      { importId: 1, postedDate: "2026-02-14", merchantRaw: "UNITED AIRLINES", merchantNormalized: "united airlines", amountDollars: -660.82, categoryId: 5, accountType: "amex_gold" },
+      { importId: 1, postedDate: "2026-02-20", merchantRaw: "PAYMENT THANK YOU", merchantNormalized: "payment thank you", amountDollars: 500, categoryId: null, accountType: "chase" },
+    );
+  });
+
+  it("returns charges only by default, newest first", async () => {
+    const r = (await registry.invoke("search_transactions", {}, ctx)) as {
+      rows: Array<{ postedDate: string; amountDollars: number }>;
+      totalMatched: number;
+      returned: number;
+      truncated: boolean;
+    };
+    expect(r.totalMatched).toBe(4);            // the +500 credit is excluded
+    expect(r.returned).toBe(4);
+    expect(r.truncated).toBe(false);
+    expect(r.rows.every((x) => x.amountDollars < 0)).toBe(true);
+    expect(r.rows[0]!.postedDate).toBe("2026-02-14");
+    expect(ctx.audit.records).toHaveLength(0); // read-only
+  });
+
+  it("includeCredits admits positive rows", async () => {
+    const r = (await registry.invoke("search_transactions", { includeCredits: true }, ctx)) as {
+      totalMatched: number;
+      rows: Array<{ amountDollars: number }>;
+    };
+    expect(r.totalMatched).toBe(5);
+    expect(r.rows.some((x) => x.amountDollars > 0)).toBe(true);
+  });
+
+  it("matches the merchant case-insensitively as a substring", async () => {
+    const r = (await registry.invoke("search_transactions", { merchant: "trader" }, ctx)) as {
+      totalMatched: number;
+    };
+    expect(r.totalMatched).toBe(2);
+    // Matching against merchant_raw (uppercase in the fixture) works too.
+    const r2 = (await registry.invoke("search_transactions", { merchant: "shell oil 4471" }, ctx)) as {
+      totalMatched: number;
+    };
+    expect(r2.totalMatched).toBe(1);
+  });
+
+  it("bounds posted dates inclusively at both ends", async () => {
+    const r = (await registry.invoke(
+      "search_transactions",
+      { from: "2026-01-20", to: "2026-02-02" },
+      ctx,
+    )) as { totalMatched: number; rows: Array<{ postedDate: string }> };
+    expect(r.totalMatched).toBe(2);
+    expect(r.rows.map((x) => x.postedDate).sort()).toEqual(["2026-01-20", "2026-02-02"]);
+  });
+
+  it("filters on absolute amount and on category", async () => {
+    const big = (await registry.invoke("search_transactions", { minAmountDollars: 100 }, ctx)) as {
+      totalMatched: number;
+    };
+    expect(big.totalMatched).toBe(2); // 114.50 and 660.82
+    const food = (await registry.invoke("search_transactions", { categoryId: 4 }, ctx)) as {
+      totalMatched: number;
+    };
+    expect(food.totalMatched).toBe(2);
+  });
+
+  it("pages with limit/offset and reports truncation against totalMatched", async () => {
+    const page1 = (await registry.invoke("search_transactions", { limit: 2 }, ctx)) as {
+      returned: number;
+      totalMatched: number;
+      truncated: boolean;
+      rows: Array<{ postedDate: string }>;
+    };
+    expect(page1).toMatchObject({ returned: 2, totalMatched: 4, truncated: true });
+
+    const page2 = (await registry.invoke("search_transactions", { limit: 2, offset: 2 }, ctx)) as {
+      returned: number;
+      truncated: boolean;
+      rows: Array<{ postedDate: string }>;
+    };
+    expect(page2).toMatchObject({ returned: 2, truncated: false });
+    // Pages don't overlap.
+    expect(page2.rows.map((r) => r.postedDate)).not.toEqual(page1.rows.map((r) => r.postedDate));
+  });
+
+  it("rejects a limit above the cap and a malformed date", async () => {
+    await expect(registry.invoke("search_transactions", { limit: 500 }, ctx)).rejects.toThrow(
+      ToolArgError,
+    );
+    await expect(registry.invoke("search_transactions", { from: "Jan 2026" }, ctx)).rejects.toThrow(
+      ToolArgError,
+    );
+  });
+
+  it("top_merchants ranks by positive spend, biggest first", async () => {
+    const r = (await registry.invoke("top_merchants", {}, ctx)) as {
+      merchants: Array<{
+        merchantNormalized: string;
+        merchantRawSample: string;
+        txnCount: number;
+        totalDollars: number;
+        avgDollars: number;
+        firstSeen: string;
+        lastSeen: string;
+      }>;
+      windowFrom: string | null;
+      windowTo: string | null;
+    };
+    expect(r.merchants.map((m) => m.merchantNormalized)).toEqual([
+      "united airlines",
+      "trader joes",
+      "shell oil",
+    ]);
+    expect(r.merchants.every((m) => m.totalDollars > 0)).toBe(true);
+    const tj = r.merchants.find((m) => m.merchantNormalized === "trader joes")!;
+    expect(tj.txnCount).toBe(2);
+    expect(tj.totalDollars).toBeCloseTo(200, 2);
+    expect(tj.avgDollars).toBeCloseTo(100, 2);
+    expect(tj.firstSeen).toBe("2026-01-05");
+    expect(tj.lastSeen).toBe("2026-01-20");
+    expect(tj.merchantRawSample).toBe("TRADER JOE'S #123");
+    // The +500 credit never becomes a merchant.
+    expect(r.merchants.some((m) => m.merchantNormalized === "payment thank you")).toBe(false);
+    expect(r).toMatchObject({ windowFrom: null, windowTo: null });
+    expect(ctx.audit.records).toHaveLength(0);
+  });
+
+  it("top_merchants honors the window + limit and echoes the window back", async () => {
+    const r = (await registry.invoke(
+      "top_merchants",
+      { from: "2026-02-01", to: "2026-02-28", limit: 1 },
+      ctx,
+    )) as { merchants: Array<{ merchantNormalized: string }>; windowFrom: string; windowTo: string };
+    expect(r.merchants).toHaveLength(1);
+    expect(r.merchants[0]!.merchantNormalized).toBe("united airlines");
+    expect(r).toMatchObject({ windowFrom: "2026-02-01", windowTo: "2026-02-28" });
+  });
+
+  it("compute_category_baselines reports POSITIVE cost per category", async () => {
+    const r = (await registry.invoke("compute_category_baselines", { windowMonths: 12 }, ctx)) as {
+      asOf: string;
+      windowMonths: number;
+      baselines: Array<{
+        category: string;
+        monthlyAverageDollars: number;
+        monthlyMedianDollars: number;
+        windowTotalDollars: number;
+        monthsWithActivity: number;
+        txnCount: number;
+      }>;
+    };
+    // asOf defaults to the newest charge on file (the +500 credit is not one).
+    expect(r.asOf).toBe("2026-02-14");
+    expect(r.windowMonths).toBe(12);
+    expect(r.baselines.every((b) => b.monthlyAverageDollars >= 0)).toBe(true);
+    expect(r.baselines.every((b) => b.windowTotalDollars >= 0)).toBe(true);
+
+    const food = r.baselines.find((b) => b.category === "Food")!;
+    expect(food.txnCount).toBe(2);
+    expect(food.monthsWithActivity).toBe(1);      // both charges are in 2026-01
+    expect(food.windowTotalDollars).toBeCloseTo(200, 2);
+    expect(food.monthlyAverageDollars).toBeCloseTo(200 / 12, 2);
+    expect(food.monthlyMedianDollars).toBeCloseTo(200, 2);
+
+    const transport = r.baselines.find((b) => b.category === "Transport")!;
+    expect(transport.windowTotalDollars).toBeCloseTo(720.82, 2);
+    expect(ctx.audit.records).toHaveLength(0);
+  });
+
+  it("compute_category_baselines honors an explicit asOf window", async () => {
+    const r = (await registry.invoke(
+      "compute_category_baselines",
+      { windowMonths: 1, asOf: "2026-01-31" },
+      ctx,
+    )) as { asOf: string; baselines: Array<{ category: string; windowTotalDollars: number }> };
+    expect(r.asOf).toBe("2026-01-31");
+    // Only January's two grocery charges fall inside a 1-month window.
+    expect(r.baselines).toHaveLength(1);
+    expect(r.baselines[0]!.category).toBe("Food");
+    expect(r.baselines[0]!.windowTotalDollars).toBeCloseTo(200, 2);
+  });
+});
+
+describe("backfill_spend_dates", () => {
+  let ctx: ReturnType<typeof mkMemoryCtx>;
+  let registry: ToolRegistry;
+
+  beforeEach(async () => {
+    ctx = mkMemoryCtx();
+    registry = new ToolRegistry(ALL_TOOLS);
+    ctx.__insertedTxns.push({
+      importId: 1,
+      postedDate: "2026-02-14",
+      merchantRaw: "UNITED AIRLINES",
+      merchantNormalized: "united airlines",
+      amountDollars: -660.82,
+      categoryId: 5,
+      accountType: "amex_gold",
+    });
+    await registry.invoke(
+      "add_expense",
+      { workspaceId: 1, label: "UNITED AIRLINES", amountDollars: 660.82, frequency: "one_time" },
+      ctx,
+    );
+  });
+
+  it("dryRun reports the matches without writing, then a live run applies them", async () => {
+    const preview = (await registry.invoke("backfill_spend_dates", { dryRun: true }, ctx)) as {
+      dryRun: boolean;
+      scanned: number;
+      matched: number;
+      changed: Array<{ id: number; label?: string; spendDate: string }>;
+    };
+    expect(preview).toMatchObject({ dryRun: true, scanned: 1, matched: 1 });
+    expect(preview.changed[0]).toMatchObject({ label: "UNITED AIRLINES", spendDate: "2026-02-14" });
+    // Nothing was written.
+    expect(ctx.expenses.list(1)[0]!.spendDate).toBeNull();
+
+    const live = (await registry.invoke("backfill_spend_dates", {}, ctx)) as {
+      dryRun: boolean;
+      matched: number;
+      changed: Array<{ id: number }>;
+    };
+    expect(live).toMatchObject({ dryRun: false, matched: 1 });
+    expect(ctx.expenses.list(1)[0]!.spendDate).toBe("2026-02-14");
+
+    // Idempotent: a second pass finds nothing left to do.
+    const again = (await registry.invoke("backfill_spend_dates", {}, ctx)) as { scanned: number };
+    expect(again.scanned).toBe(0);
+  });
+
+  it("is a mutating tool — both the preview and the live run are audited", async () => {
+    await registry.invoke("backfill_spend_dates", { dryRun: true }, ctx);
+    await registry.invoke("backfill_spend_dates", {}, ctx);
+    expect(
+      ctx.audit.records.filter((r) => r.toolName === "backfill_spend_dates"),
+    ).toHaveLength(2);
   });
 });

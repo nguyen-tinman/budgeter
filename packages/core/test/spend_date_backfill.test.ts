@@ -132,6 +132,25 @@ describe("backfillOneTimeSpendDates", () => {
     expect(res.changed).toEqual([{ id: 1, label: "UNITED AIRLINES", spendDate: "2025-09-14" }]);
   });
 
+  it("dryRun computes the same matches but writes nothing", () => {
+    const rows = [
+      { id: 1, frequency: "one_time", spendDate: null, label: "UNITED AIRLINES", amountDollars: 660.82 },
+    ];
+    const txns = [
+      { merchantRaw: "UNITED AIRLINES", merchantNormalized: "united airlines", postedDate: "2025-09-14", amountDollars: -660.82 },
+    ];
+    const dry = fakeCtx(rows, txns);
+    const dryRes = backfillOneTimeSpendDates(dry.ctx, { dryRun: true });
+    const live = fakeCtx(rows, txns);
+    const liveRes = backfillOneTimeSpendDates(live.ctx);
+
+    // Identical report either way — only the write differs.
+    expect(dryRes).toEqual(liveRes);
+    expect(dryRes.changed).toEqual([{ id: 1, label: "UNITED AIRLINES", spendDate: "2025-09-14" }]);
+    expect(dry.updates).toEqual([]);
+    expect(live.updates).toEqual([{ id: 1, spendDate: "2025-09-14" }]);
+  });
+
   it("skips the transaction fetch entirely when nothing needs backfilling", () => {
     let fetched = false;
     const ctx = {

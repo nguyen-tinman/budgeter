@@ -145,3 +145,90 @@ describe("computeTrends — category attribution", () => {
     expect(r.categories["4"]!.series[0]).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Overlays — %-of-salary contributions resolve per owning filer
+// ---------------------------------------------------------------------------
+
+/** buildArgs with real incomes + savings so the overlay math is exercised.
+ *  Expenses stay empty; only the savings/retirement overlays are asserted. */
+function overlayArgs(
+  incomeRows: Array<{ grossAnnualDollars: number; taxStatus: string; filingRole: string }>,
+  savingsRows: Array<{
+    label: string;
+    accountType: string;
+    monthlyContributionDollars?: number;
+    contributionPctOfSalary?: number | null;
+    filingRole?: string;
+  }>,
+) {
+  const base = buildArgs([]);
+  const incomes = {
+    list: () =>
+      incomeRows.map((i, n) => ({
+        id: n + 1, workspaceId: 1, label: `Income ${n}`,
+        grossAnnualDollars: i.grossAnnualDollars, taxStatus: i.taxStatus,
+        isFederalIncomeTax: true, filingRole: i.filingRole,
+      })),
+  } as unknown as IncomeRepo;
+  const savings = {
+    list: () =>
+      savingsRows.map((s, n) => ({
+        id: n + 1, workspaceId: 1, label: s.label,
+        currentBalanceDollars: 0, targetBalanceDollars: null,
+        monthlyContributionDollars: s.monthlyContributionDollars ?? 0,
+        accountType: s.accountType,
+        contributionPctOfSalary: s.contributionPctOfSalary ?? null,
+        employerMatchKind: "none", employerMatchValue: null,
+        taxTreatment: null, filingRole: s.filingRole ?? "primary",
+      })),
+  } as unknown as SavingsRepo;
+  return { ...base, incomes, savings };
+}
+
+describe("computeTrends — savings overlays scale with the OWNING filer's salary", () => {
+  it("a spouse-owned %-of-salary 401k derives from the spouse's taxed gross", () => {
+    // Unequal salaries so the two bases can't be confused: primary $100k,
+    // spouse $200k. 10% of the spouse's salary = $1,666.67/mo; keying off the
+    // primary would give $833.33/mo.
+    const r = computeTrends(
+      overlayArgs(
+        [
+          { grossAnnualDollars: 100_000, taxStatus: "taxed", filingRole: "primary" },
+          { grossAnnualDollars: 200_000, taxStatus: "taxed", filingRole: "spouse" },
+        ],
+        [
+          {
+            label: "Spouse 401k",
+            accountType: "traditional_401k",
+            contributionPctOfSalary: 0.1,
+            filingRole: "spouse",
+          },
+        ],
+      ),
+    );
+    expect(r.overlays.retirement.series.every((v) => v === 1666.67)).toBe(true);
+    expect(r.overlays.savings.series.every((v) => v === 0)).toBe(true);
+  });
+
+  it("primary-owned rows are unchanged and both filers' rows sum correctly", () => {
+    const r = computeTrends(
+      overlayArgs(
+        [
+          { grossAnnualDollars: 100_000, taxStatus: "taxed", filingRole: "primary" },
+          { grossAnnualDollars: 200_000, taxStatus: "taxed", filingRole: "spouse" },
+        ],
+        [
+          { label: "Spouse 401k", accountType: "traditional_401k", contributionPctOfSalary: 0.1, filingRole: "spouse" },
+          { label: "Primary 401k", accountType: "traditional_401k", contributionPctOfSalary: 0.1, filingRole: "primary" },
+          // A non-retirement row lands in the other overlay, still per-owner.
+          { label: "Spouse Brokerage", accountType: "brokerage", contributionPctOfSalary: 0.01, filingRole: "spouse" },
+        ],
+      ),
+    );
+    // $1,666.67 (spouse 10% of $200k) + $833.33 (primary 10% of $100k).
+    expect(r.overlays.retirement.series[0]).toBe(2500);
+    // 1% of the spouse's $200k = $166.67/mo, not 1% of the primary's $100k.
+    expect(r.overlays.savings.series[0]).toBe(166.67);
+  });
+});
