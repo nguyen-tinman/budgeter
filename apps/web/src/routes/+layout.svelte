@@ -5,6 +5,7 @@
   import { api } from "$lib/api.js";
   import { refreshWorkspaces, setActiveWorkspace, workspaceState } from "$lib/workspace.svelte.js";
   import { hydrateShellState, shellState, setShellPref, setModal } from "$lib/appShellState.svelte.js";
+  import { assistantMode, refreshAssistantSetup } from "$lib/assistantSetup.svelte.js";
 
   import Icon from "$lib/components/Icon.svelte";
   import WorkspacePicker from "$lib/components/WorkspacePicker.svelte";
@@ -24,13 +25,19 @@
     { href: "/library",  label: "Import",    kicker: "III"  },
     { href: "/planning", label: "Planning",  kicker: "IV"   },
     { href: "/trends",   label: "Trends",    kicker: "V"    },
-    { href: "/setup",    label: "Setup",     kicker: "VI"   },
-    { href: "/options",  label: "Options",   kicker: "VII"  },
+    { href: "/custom",   label: "Custom",    kicker: "VI"   },
+    { href: "/setup",    label: "Setup",     kicker: "VII"  },
+    { href: "/options",  label: "Options",   kicker: "VIII" },
   ];
+
+  /** Onboarding badge: the local model has never been downloaded, so the Setup
+   *  tab (and the assistant toggle) carry a dot pointing the user at it. */
+  const needsAssistantSetup = $derived(assistantMode() === "not_set_up");
 
   onMount(() => {
     hydrateShellState();
     void refreshWorkspaces();
+    void refreshAssistantSetup();
 
     function onKey(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -80,7 +87,8 @@
   style:height="100vh"
   style:width="100vw"
   style:position="relative"
-  style:overflow="hidden"
+  style:overflow-x="auto"
+  style:overflow-y="hidden"
 >
   <a href="#bk-main" class="bk-skip">Skip to main content</a>
 
@@ -101,6 +109,13 @@
           >
             <span class="bk-nav-kicker">{item.kicker}</span>
             <span>{item.label}</span>
+            {#if needsAssistantSetup && item.href === "/setup"}
+              <span
+                class="bk-nav-dot"
+                data-testid="nav-setup-badge"
+                title="The local assistant model isn't set up yet"
+              ></span>
+            {/if}
           </a>
         {/each}
       </div>
@@ -148,11 +163,17 @@
         {#if !shell.chatOpen}
           <button
             class="bk-iconbtn"
+            style="position: relative"
             aria-label="Open assistant"
-            title="Assistant"
+            title={needsAssistantSetup ? "Assistant — not set up yet" : "Assistant"}
             data-testid="chat-toggle"
             onclick={() => setShellPref("chatOpen", true)}
-          ><Icon name="chat" size={16} /></button>
+          >
+            <Icon name="chat" size={16} />
+            {#if needsAssistantSetup}
+              <span class="bk-nav-dot" data-float="true" data-testid="chat-toggle-badge"></span>
+            {/if}
+          </button>
         {/if}
       </div>
     </nav>

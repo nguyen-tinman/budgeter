@@ -689,7 +689,7 @@
   <EdSection
     num={3}
     title="Retirement projection"
-    deck="Year-by-year balance growth from current age to retirement age. Contributions sum from this workspace's 401k / Roth-IRA / Roth-401k buckets."
+    deck="Year-by-year balance growth from current age to retirement age. Contributions sum from this workspace's 401k / Roth‑IRA / Roth‑401k buckets."
   >
     <div style="display: grid; grid-template-columns: repeat(5, 1fr) auto; gap: 10px; margin-bottom: 22px; align-items: end">
       <label class="bk-field"><span class="bk-field-label">Current age</span>

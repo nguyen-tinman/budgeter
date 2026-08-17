@@ -50,7 +50,76 @@ export type ToolName =
   | "dedupe_expenses"
   | "list_tax_tables"
   | "fetch_tax_source_by_year"
-  | "import_tax_table";
+  | "import_tax_table"
+  // Custom page (Section VI). `query_transactions`/`get_custom_page`/
+  // `set_custom_page` are the page's own tools; the remaining names are
+  // pre-existing read-only tools that a definition may declare as queries and
+  // that the page's query runner therefore has to be able to invoke.
+  | "query_transactions"
+  | "get_custom_page"
+  | "set_custom_page"
+  | "search_transactions"
+  | "top_merchants"
+  | "list_categories"
+  | "compute_budget_summary"
+  | "compute_category_baselines";
+
+// /custom page contract — imported from the `custom_page` SUBPATH, never the
+// barrel. The barrel re-exports statement_parser/chase_parser/csv_parser, which
+// pull node:fs, node:path, pdfjs-dist and xlsx into whatever imports them; the
+// subpath's only transitive import is tool_registry.js, which has no imports at
+// all, so it is browser-safe (same reasoning as the retirement_projector and
+// account_tax imports above). These are the real values, so the allowlist, the
+// placeholder, the query cap and the substitution rule now have exactly one
+// definition shared by server and client.
+import {
+  CUSTOM_PAGE_QUERY_TOOLS,
+  MAX_QUERIES,
+  WORKSPACE_ID_PLACEHOLDER,
+  substituteWorkspaceId,
+  type CustomPageDefinition,
+  type CustomPageQuery,
+  type CustomPageQueryTool,
+} from "@budgetkit/core/custom_page";
+export {
+  CUSTOM_PAGE_QUERY_TOOLS,
+  MAX_QUERIES,
+  WORKSPACE_ID_PLACEHOLDER,
+  substituteWorkspaceId,
+};
+export type { CustomPageDefinition, CustomPageQuery, CustomPageQueryTool };
+
+/** Compile-time proof that every tool core lets a definition declare is a name
+ *  this client can actually invoke. If core widens its allowlist without
+ *  ToolName being widened to match, this stops the build instead of failing at
+ *  runtime on someone's page load. Type-level only — no runtime cost. (The
+ *  value-level counterpart is the membership check in the /custom query runner,
+ *  which guards against a stored definition naming something else entirely.) */
+const _allowlistIsInvokable: CustomPageQueryTool extends ToolName ? true : never = true;
+void _allowlistIsInvokable;
+
+/** Result of `get_custom_page`. `exists:false` is the blank page (not an
+ *  error); `hasPrevious` drives the "Undo last change" button. */
+export interface CustomPageState {
+  exists: boolean;
+  updatedAt: string | null;
+  definition: CustomPageDefinition | null;
+  hasPrevious: boolean;
+  /** Authoring guide, returned only when requested with includeGuide. The UI
+   *  never asks for it — it exists for the assistant. */
+  guide?: string;
+}
+
+/** Result of `set_custom_page`. Which optional fields are present depends on
+ *  the action taken (set → updatedAt, reset → hadDefinition, revert →
+ *  reverted + updatedAt). */
+export interface SetCustomPageResult {
+  saved: boolean;
+  action: "set" | "reset" | "revert";
+  updatedAt?: string | null;
+  hadDefinition?: boolean;
+  reverted?: boolean;
+}
 
 export interface SavingsItem {
   id: number;
@@ -60,7 +129,8 @@ export interface SavingsItem {
   targetBalanceDollars: number | null;
   monthlyContributionDollars: number;
   accountType: SavingsAccountType;
-  /** 0..1 fraction of primary taxed gross treated as the employee contribution. */
+  /** 0..1 fraction of the owning filer's taxed gross (per filingRole) treated
+   *  as the employee contribution. */
   contributionPctOfSalary: number | null;
   employerMatchKind: EmployerMatchKind;
   /** Interpretation depends on employerMatchKind. */
@@ -191,6 +261,31 @@ export interface TaxTablesResult {
   years: number[];
 }
 
+/** One undo point: the state captured just before a user turn ran. */
+export interface UndoSnapshot {
+  id: string;
+  takenAt: string;
+  /** Echo of the user message that opened the turn, for the button's tooltip. */
+  label: string;
+  sizeBytes: number;
+}
+
+export interface UndoListResponse {
+  ok: boolean;
+  depth: number;
+  available: number;
+  snapshots: UndoSnapshot[];
+}
+
+export interface UndoApplyResponse {
+  ok: boolean;
+  error?: string;
+  message?: string;
+  snapshot?: UndoSnapshot;
+  remaining?: number;
+  affectedResources?: string[];
+}
+
 export interface LlamaStatus {
   status: "stopped" | "starting" | "ready" | "error" | "external";
   url: string;
@@ -199,6 +294,17 @@ export interface LlamaStatus {
   error: string | null;
   backendMode: "vulkan" | "cpu" | "cpu-fallback" | "unknown";
   backendWarning: string | null;
+  /** A recovery the user can trigger when the launcher could not fall back on
+   *  its own — currently only "no CPU-capable model is downloaded". Rendered as
+   *  a button on the Setup page rather than left as a stderr tail. */
+  action: LlamaAction | null;
+}
+
+export interface LlamaAction {
+  kind: "install-model";
+  modelId: string;
+  label: string;
+  message: string;
 }
 
 /** One selectable local model, with whether its GGUF is present on disk. */
@@ -218,6 +324,11 @@ export interface LlamaModelsResponse {
   models: LlamaModelInfo[];
   lastUsed: string | null;
   selected: string | null;
+  /** Which model first-time setup would download, chosen from free VRAM. */
+  recommended: string;
+  /** Plain-language justification for `recommended`, shown on /setup. */
+  recommendedReason: string;
+  gpu: { name: string; totalMiB: number; freeMiB: number } | null;
 }
 
 export interface SetupStep {
@@ -610,6 +721,55 @@ export const api = {
    *  table — there is no hardcoded bracket copy in the UI. */
   listTaxTables: () => invoke<TaxTablesResult>("list_tax_tables"),
 
+  /** Read the assistant-authored /custom page definition. `includeGuide` is
+   *  never set from the UI — the authoring guide is for the model. */
+  getCustomPage: (opts: { includeGuide?: boolean } = {}) =>
+    invoke<CustomPageState>("get_custom_page", opts),
+  /** Write / blank / undo the /custom page. The registry treats this as a
+   *  mutation (audited); `invoke` asserts the user's click as consent exactly
+   *  as it does for every other mutating tool in this UI. */
+  setCustomPage: (
+    args:
+      | { action: "reset" }
+      | { action: "revert" }
+      | {
+          action: "set";
+          title: string;
+          note?: string;
+          queries: CustomPageQuery[];
+          render: string;
+        },
+  ) => invoke<SetCustomPageResult>("set_custom_page", args),
+  /** Run one query declared by a /custom definition. The name is constrained to
+   *  the read-only allowlist by its type, so this passthrough cannot be used to
+   *  reach a mutating tool. */
+  invokeQueryTool: <T = unknown>(tool: CustomPageQueryTool, args: Record<string, unknown>) =>
+    invoke<T>(tool, args),
+
+  /** Tell the server how the custom page actually turned out in the browser.
+   *  chat.ts injects the last report into the assistant's context every turn,
+   *  which is the only way it learns that a definition it wrote fails at run
+   *  time. Fire-and-forget: a failed report must never break the page. */
+  reportCustomPageStatus: (body: {
+    state: "ok" | "blank" | "query_error" | "render_error" | "sandbox_failed";
+    message?: string;
+    title?: string;
+  }): void => {
+    void fetch("/api/custom-page/status", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch(() => undefined);
+  },
+
+  /** Undo of assistant-driven changes, one step per user turn. Deliberately
+   *  outside `invoke` — undo is not a tool, so the assistant cannot call it. */
+  undo: {
+    list: () => fetch("/api/undo").then((r) => r.json() as Promise<UndoListResponse>),
+    apply: () =>
+      fetch("/api/undo", { method: "POST" }).then((r) => r.json() as Promise<UndoApplyResponse>),
+  },
+
   llama: {
     status: () => fetch("/api/llama/status").then((r) => r.json() as Promise<LlamaStatus>),
     /** Registry + on-disk presence + selected/last-used model ids. */
@@ -730,7 +890,20 @@ export const api = {
         /** The model is reasoning (chain-of-thought is hidden). `active` is true
          *  when reasoning starts; the next delta/tool/done implicitly ends it. */
         onThinking?: (active: boolean) => void;
+        /** Prompt evaluation (prefill) started for a turn — the model is busy
+         *  but generating nothing yet. Ends at the first thinking/delta event.
+         *  Distinct from onThinking, which means tokens ARE being produced. */
+        onProcessing?: (turn: number) => void;
         onPending?: (actions: ChatPendingAction[]) => void;
+        /** One reasoning step finished: the model narrated `text` and is about
+         *  to run `tools`. Fires per turn of a multi-step task so the UI can
+         *  keep each step visible — `done` only carries the FINAL turn's text. */
+        onStep?: (step: { turn: number; text: string; tools: string[] }) => void;
+        /** An auto-applied mutating tool (today: set_custom_page only) finished
+         *  successfully MID-TURN. Fires before `done` so subscribed pages can
+         *  repaint while the model is still narrating. The terminal `done`
+         *  payload repeats the same resources; refetches are idempotent. */
+        onApplied?: (payload: ChatAppliedEvent) => void;
         onDone?: (final: ChatSendResponse) => void;
         onError?: (err: ChatSendResponse) => void;
       },
@@ -770,6 +943,19 @@ export const api = {
         else if (event === "tool") handlers.onTool?.((parsed as { name: string }).name ?? "");
         else if (event === "pending")
           handlers.onPending?.((parsed as { pendingActions: ChatPendingAction[] }).pendingActions ?? []);
+        else if (event === "applied")
+          handlers.onApplied?.({
+            name: (parsed as { name?: string }).name ?? "",
+            affectedResources: (parsed as { affectedResources?: string[] }).affectedResources ?? [],
+          });
+        else if (event === "processing")
+          handlers.onProcessing?.((parsed as { turn?: number }).turn ?? 0);
+        else if (event === "step")
+          handlers.onStep?.({
+            turn: (parsed as { turn?: number }).turn ?? 0,
+            text: (parsed as { text?: string }).text ?? "",
+            tools: (parsed as { tools?: string[] }).tools ?? [],
+          });
         else if (event === "done") handlers.onDone?.(parsed as ChatSendResponse);
         else if (event === "error") handlers.onError?.(parsed as ChatSendResponse);
       });
@@ -828,16 +1014,43 @@ export const api = {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       }).then((r) => r.json()),
-    /** Reset any server-side chat state. The server has none today; this
-     *  exists so the UI's "New chat" button + /clear slash command have a
-     *  single endpoint to call as the API grows. */
+    /** Discard the stored transcript. Backs "New chat" and /clear — the only
+     *  two things that throw the conversation away. */
     clear: () =>
       fetch("/api/chat/clear", {
         method: "POST",
         headers: { "content-type": "application/json" },
       }).then((r) => r.json()),
+    /** The transcript to restore on mount, with the folded-context summary that
+     *  belongs to it. */
+    log: (): Promise<{
+      ok: boolean;
+      messages: StoredChatMessage[];
+      priorSummary: string | null;
+    }> => fetch("/api/chat/log").then((r) => r.json()),
+    /** Persist the rendered transcript. Called after a turn settles, so the
+     *  stored copy matches what is on screen (chips folded, steps merged). */
+    saveLog: (messages: StoredChatMessage[], priorSummary: string | null) =>
+      fetch("/api/chat/log", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages, priorSummary }),
+      }).then((r) => r.json()),
   },
 };
+
+/** A chat bubble as it is stored and restored. Mirrors ChatPanel's ChatMessage
+ *  minus the transient fields — pendingActions in particular are never
+ *  persisted, so a reload cannot resurrect an Approve button for a mutation
+ *  proposed against a workspace state that has since moved on. */
+export interface StoredChatMessage {
+  role: "user" | "assistant" | "system";
+  text: string;
+  tools?: Array<{ name: string; count?: number }>;
+  step?: boolean;
+  stopped?: boolean;
+  compactionNotice?: boolean;
+}
 
 /** One proposed category change from `/classify`, reviewed before any write. */
 export interface ClassifyRecommendation {
@@ -875,6 +1088,14 @@ export interface ChatCompactionInfo {
   summary: string;
   droppedCount: number;
   keptRecentCount: number;
+}
+
+/** Payload of the mid-stream `applied` SSE event: a mutating tool the chat
+ *  route auto-applied (no approval card) has committed, and these resources
+ *  are now stale. Frozen wire shape shared with apps/api. */
+export interface ChatAppliedEvent {
+  name: string;
+  affectedResources: string[];
 }
 
 /** One mutating action the assistant proposed that the server PAUSED on,

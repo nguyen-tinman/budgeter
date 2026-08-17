@@ -202,9 +202,15 @@ export function computeTrends(args: {
   const takeHomeMonthly = args.takeHomeMonthlyDollars ?? round2(grossMonthly * 0.7);
 
   // Employee-side monthly contributions (pct-of-salary aware; employer match
-  // excluded), split into retirement vs other-savings overlays.
+  // excluded), split into retirement vs other-savings overlays. A row's
+  // %-of-salary resolves against the taxed gross of the filer who OWNS it
+  // (savings.filingRole) — same per-owner semantics as compute_take_home's
+  // resolveWithholdingsByOwner and compute_retirement.
   const primaryTaxedGross = incomeRows
     .filter((i) => i.filingRole === "primary" && i.taxStatus === "taxed")
+    .reduce((s, i) => s + i.grossAnnualDollars, 0);
+  const spouseTaxedGross = incomeRows
+    .filter((i) => i.filingRole === "spouse" && i.taxStatus === "taxed")
     .reduce((s, i) => s + i.grossAnnualDollars, 0);
   const savingsRows = args.savings.list(workspaceId);
   let savingsMonthly = 0;
@@ -214,7 +220,10 @@ export function computeTrends(args: {
                    s.accountType === "roth_401k" ||
                    s.accountType === "roth_ira" ||
                    s.accountType === "hsa";
-    const m = resolveContributionSplit(s, primaryTaxedGross).employeeMonthly;
+    const m = resolveContributionSplit(
+      s,
+      s.filingRole === "spouse" ? spouseTaxedGross : primaryTaxedGross,
+    ).employeeMonthly;
     if (retire) retirementMonthly = round2(retirementMonthly + m);
     else savingsMonthly = round2(savingsMonthly + m);
   }

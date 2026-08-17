@@ -18,6 +18,20 @@ import { expenseDupKey, findDuplicateGroups } from "./expense_dedup.js";
 import type { RawTxn } from "./statement_parser.js";
 import { defaultMerchantCategorizer } from "./category_resolver.js";
 import { computeTrends } from "./trends_calculator.js";
+import { expenseMonthlyDollars } from "./budget_math.js";
+import { rollByCategory } from "./baseline_roller.js";
+import { backfillOneTimeSpendDates } from "./spend_date_backfill.js";
+import {
+  CUSTOM_PAGE_GUIDE,
+  CUSTOM_PAGE_QUERY_TOOLS,
+  MAX_NOTE_CHARS,
+  MAX_QUERIES,
+  MAX_RENDER_CHARS,
+  MAX_TITLE_CHARS,
+  QUERY_ID_PATTERN,
+  serializeCustomPageDefinition,
+  validateCustomPageDefinition,
+} from "./custom_page.js";
 import { resolveWithholdingsByOwner, TAX_TREATMENTS } from "./account_tax.js";
 import { round2 } from "./money.js";
 import {
@@ -43,6 +57,12 @@ const FREQUENCIES = [
 ] as const;
 
 const TAX_STATUSES = ["pretax", "posttax", "taxed", "untaxable"] as const;
+
+/** Shape gate for every YYYY-MM-DD field in the registry. FORMAT ONLY — it
+ *  rejects "last Tuesday" and "07/04/2025" (the shapes an LLM actually gets
+ *  wrong) but not an impossible calendar date like 2025-13-45; the handlers
+ *  and SQLite treat those as ordinary strings. Anchored and backtracking-free. */
+const ISO_DATE_PATTERN = "^\\d{4}-\\d{2}-\\d{2}$";
 
 const SAVINGS_ACCOUNT_TYPES = [
   "hysa",
@@ -273,7 +293,12 @@ const add_expense: ToolDef = {
         description: "Cost in dollars (positive number; $25 = 25, $25.99 = 25.99)",
       },
       frequency: { type: "string", enum: [...FREQUENCIES] },
-      spendDate: { type: "string", description: "For one_time expenses: YYYY-MM-DD the spend occurred (drives Trends placement). Ignored for recurring frequencies." },
+      spendDate: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        nullable: true,
+        description: "For one_time expenses: YYYY-MM-DD the spend occurred (drives Trends placement). Ignored for recurring frequencies; send null for no date.",
+      },
       categoryId: { type: "integer", description: "Optional category id — overrides auto-categorization" },
     },
     required: ["workspaceId", "label", "amountDollars", "frequency"],
@@ -290,7 +315,7 @@ const add_expense: ToolDef = {
       label: string;
       amountDollars: number;
       frequency: string;
-      spendDate?: string;
+      spendDate?: string | null;
       categoryId?: number;
     };
     // Auto-categorize when the caller didn't supply a category. This gives
@@ -320,8 +345,17 @@ const update_expense: ToolDef = {
       label: { type: "string" },
       amountDollars: { type: "number", minimum: 0 },
       frequency: { type: "string", enum: [...FREQUENCIES] },
-      spendDate: { type: "string", description: "For one_time expenses: YYYY-MM-DD; ignored for recurring frequencies." },
-      categoryId: { type: "integer" },
+      spendDate: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        nullable: true,
+        description: "For one_time expenses: YYYY-MM-DD; ignored for recurring frequencies. Send null to clear the stored date.",
+      },
+      categoryId: {
+        type: "integer",
+        nullable: true,
+        description: "Category id from list_categories. Send null to clear the category (leaves the expense uncategorized).",
+      },
     },
     required: ["id"],
     additionalProperties: false,
@@ -668,11 +702,31 @@ const list_savings: ToolDef = {
   },
 };
 
+/** Guard the one employer-match combination the schema can't express: with
+ *  kind='pct_of_salary' the value is a 0..1 FRACTION, but the column's single
+ *  numeric bound is 100000 (it also has to admit flat_annual_dollars). A caller
+ *  typing "5" for 5% would otherwise persist a 500%-of-salary match. */
+function assertEmployerMatchFraction(a: {
+  employerMatchKind?: string;
+  employerMatchValue?: number | null;
+}): void {
+  if (
+    a.employerMatchKind === "pct_of_salary" &&
+    a.employerMatchValue !== undefined &&
+    a.employerMatchValue !== null &&
+    a.employerMatchValue > 1
+  ) {
+    throw new Error(
+      `employerMatchValue must be a 0..1 fraction when employerMatchKind is 'pct_of_salary' (5% = 0.05); got ${a.employerMatchValue}`,
+    );
+  }
+}
+
 const add_savings: ToolDef = {
   name: "add_savings",
   description:
     "Add a savings/investment account to a workspace. accountType is one of hysa/brokerage/roth_ira/traditional_401k/roth_401k/hsa/other. " +
-    "OPTIONAL 401k contribution-as-percentage knob: contributionPctOfSalary (0..1) overrides monthlyContributionDollars — the effective employee contribution becomes (primary_taxed_gross * pct) / 12. " +
+    "OPTIONAL 401k contribution-as-percentage knob: contributionPctOfSalary (0..1) overrides monthlyContributionDollars — the effective employee contribution becomes (owning filer's taxed gross * pct) / 12, where the owning filer is set by filingRole. " +
     "OPTIONAL employer match: employerMatchKind ∈ none|pct_of_salary|flat_annual_dollars (default 'none'), with employerMatchValue interpreted as a 0..1 fraction or an annual dollar amount accordingly.",
   inputSchema: {
     type: "object",
@@ -688,7 +742,7 @@ const add_savings: ToolDef = {
         minimum: 0,
         maximum: 1,
         description:
-          "Fraction (0..1) of primary taxed gross treated as the employee 401k contribution. Overrides monthlyContributionDollars when non-zero.",
+          "Fraction (0..1) of the OWNING filer's taxed gross (per filingRole: primary or spouse) treated as the employee 401k contribution. Overrides monthlyContributionDollars when non-zero.",
       },
       employerMatchKind: {
         type: "string",
@@ -732,6 +786,7 @@ const add_savings: ToolDef = {
   },
   handler: (args, ctx) => {
     const a = args as Parameters<typeof ctx.savings.add>[0];
+    assertEmployerMatchFraction(a);
     return ctx.savings.add(a);
   },
 };
@@ -753,7 +808,7 @@ const update_savings: ToolDef = {
         minimum: 0,
         maximum: 1,
         description:
-          "Fraction (0..1) of primary taxed gross treated as the employee 401k contribution. Overrides monthlyContributionDollars when non-zero.",
+          "Fraction (0..1) of the OWNING filer's taxed gross (per filingRole: primary or spouse) treated as the employee 401k contribution. Overrides monthlyContributionDollars when non-zero.",
       },
       employerMatchKind: {
         type: "string",
@@ -795,8 +850,14 @@ const update_savings: ToolDef = {
     properties: { updated: { type: "boolean" } },
     required: ["updated"],
   },
-  handler: (args, ctx) =>
-    ctx.savings.update(args as Parameters<typeof ctx.savings.update>[0]),
+  // The fraction guard only fires when kind and value arrive in the SAME call
+  // — updating the value alone against a stored kind='pct_of_salary' is not
+  // checked (the repo interface has no savings.get to read the stored kind).
+  handler: (args, ctx) => {
+    const a = args as Parameters<typeof ctx.savings.update>[0];
+    assertEmployerMatchFraction(a);
+    return ctx.savings.update(a);
+  },
 };
 
 const delete_savings: ToolDef = {
@@ -862,8 +923,20 @@ const set_retirement_settings: ToolDef = {
       currentAge: { type: "integer", minimum: 0, maximum: 120 },
       retirementAge: { type: "integer", minimum: 1, maximum: 120 },
       initialBalanceDollars: { type: "number", minimum: 0 },
-      growthRate: { type: "number", minimum: -1, maximum: 1 },
-      rothSplitPct: { type: "number", minimum: 0, maximum: 1 },
+      growthRate: {
+        type: "number",
+        minimum: -1,
+        maximum: 1,
+        description:
+          "Annual growth rate as a FRACTION, not a percent: 7% = 0.07, 10% = 0.10. Range -1..1.",
+      },
+      rothSplitPct: {
+        type: "number",
+        minimum: 0,
+        maximum: 1,
+        description:
+          "Fraction of contributions going to Roth (post-tax), NOT a percent: 0.5 = half Roth / half Traditional, 1 = all Roth, 0 = all Traditional.",
+      },
     },
     required: [
       "workspaceId",
@@ -945,13 +1018,18 @@ const compute_retirement: ToolDef = {
     const retirementSavings = ctx.savings
       .list(a.workspaceId)
       .filter((s) => retirementBuckets.has(s.accountType));
-    // Resolve "% of salary" against the PRIMARY taxed gross. Employer-match
-    // fractions also key off this same base. We deliberately use only the
-    // 'taxed' (W-2) lines for the 'primary' filing role — pretax/posttax
-    // adjustments don't change the salary 401k% applies to.
-    const primaryTaxedGrossAnnualDollars = ctx.incomes
-      .list(a.workspaceId)
+    // Resolve "% of salary" against the taxed gross of the filer who OWNS the
+    // account (same per-owner semantics as resolveWithholdingsByOwner, which
+    // compute_take_home and compute_sensitivity use). Employer-match fractions
+    // key off that same per-owner base. We deliberately use only the 'taxed'
+    // (W-2) lines — pretax/posttax adjustments don't change the salary that
+    // 401k% applies to.
+    const allIncomes = ctx.incomes.list(a.workspaceId);
+    const primaryTaxedGrossAnnualDollars = allIncomes
       .filter((i) => i.filingRole === "primary" && i.taxStatus === "taxed")
+      .reduce((s, i) => s + i.grossAnnualDollars, 0);
+    const spouseTaxedGrossAnnualDollars = allIncomes
+      .filter((i) => i.filingRole === "spouse" && i.taxStatus === "taxed")
       .reduce((s, i) => s + i.grossAnnualDollars, 0);
     const annualContributionDollars =
       a.annualContributionDollarsOverride ??
@@ -959,7 +1037,12 @@ const compute_retirement: ToolDef = {
         retirementSavings.reduce(
           (sum, s) =>
             sum +
-            effectiveMonthlyContributionDollars(s, primaryTaxedGrossAnnualDollars) * 12,
+            effectiveMonthlyContributionDollars(
+              s,
+              s.filingRole === "spouse"
+                ? spouseTaxedGrossAnnualDollars
+                : primaryTaxedGrossAnnualDollars,
+            ) * 12,
           0,
         ),
       );
@@ -1411,6 +1494,11 @@ const KNOWN_TAX_SOURCES = [
     jurisdiction: "federal",
   },
   {
+    label: "IRS — federal income tax rates and brackets (stable, current-year)",
+    url: "https://www.irs.gov/filing/federal-income-tax-rates-and-brackets",
+    jurisdiction: "federal",
+  },
+  {
     label: "California FTB — current-year tax rates + brackets",
     url: "https://www.ftb.ca.gov/file/personal/filing-information.html",
     jurisdiction: "ca",
@@ -1708,7 +1796,7 @@ const fetch_tax_source_by_year: ToolDef = {
   description:
     "Predict the official tax-authority page URL for a given source + year, fetch it (allowlisted hosts only: www.irs.gov, www.ftb.ca.gov), and return the relevant page text reduced to fit the assistant's context.\n" +
     "Inputs: source ('irs' for federal brackets + standard deductions, 'ca_ftb' for California rates); year (e.g. 2025); optional urlOverride (an allowlisted URL to use INSTEAD of the predicted one — pass this when prediction misses).\n" +
-    "URL PREDICTION: irs → https://www.irs.gov/newsroom/irs-provides-tax-inflation-adjustments-for-tax-year-{year} (future years are predicted on this pattern; the slug verb 'provides' vs 'releases' varies by year — if it 404s, retry with urlOverride). ca_ftb → https://www.ftb.ca.gov/file/personal/tax-rates.html (no year suffix; validated against page text).\n" +
+    "URL PREDICTION: irs → https://www.irs.gov/newsroom/irs-provides-tax-inflation-adjustments-for-tax-year-{year} (future years are predicted on this pattern; the slug verb 'provides' vs 'releases' varies by year — if it 404s, retry with urlOverride; a stable fallback is https://www.irs.gov/filing/federal-income-tax-rates-and-brackets, which lists current-year federal rates and brackets). ca_ftb → https://www.ftb.ca.gov/file/personal/tax-rates.html (no year suffix; validated against page text).\n" +
     "Returns { url, fetchedAt, textExcerpt } on success. SANITY CHECK: if the fetched page does NOT mention the requested year, returns { error, hint, url } inviting you to retry with urlOverride rather than parsing the wrong year.\n" +
     "After a successful fetch, parse the brackets + standard deduction, then call import_tax_table with dryRun:true to preview before the user confirms.",
   readOnly: true,
@@ -1766,7 +1854,7 @@ const fetch_tax_source_by_year: ToolDef = {
         error: `page returned HTTP ${fetched.status}`,
         hint:
           a.source === "irs"
-            ? `The IRS article for ${a.year} may use the 'irs-releases-...' slug instead of 'irs-provides-...', or may not be published yet. Retry with urlOverride pointing at the correct www.irs.gov article.`
+            ? `The IRS article for ${a.year} may use the 'irs-releases-...' slug instead of 'irs-provides-...', or may not be published yet. Retry with urlOverride pointing at the correct www.irs.gov article, or use the stable rates page https://www.irs.gov/filing/federal-income-tax-rates-and-brackets.`
             : "Retry with urlOverride pointing at the correct www.ftb.ca.gov page (e.g. the filing-information index).",
       };
     }
@@ -2920,6 +3008,833 @@ const ignore_statement: ToolDef = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Taxonomy + tax-settings tools
+// ---------------------------------------------------------------------------
+
+const list_categories: ToolDef = {
+  name: "list_categories",
+  description:
+    "List the budget category taxonomy (id, name, colorHex), ordered by id. Use this to map a category NAME the user says into the numeric categoryId that add_expense/update_expense and the search/summary tools expect.",
+  readOnly: true,
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  outputSchema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        name: { type: "string" },
+        colorHex: { type: "string" },
+      },
+    },
+  },
+  handler: (_args, ctx) => ctx.categories.listAll(),
+};
+
+const get_tax_settings: ToolDef = {
+  name: "get_tax_settings",
+  description:
+    "Get a workspace's tax settings: filing status, tax year, CA SDI rate, Social Security wage base, FICA rates, and the effective tax rate used for retirement withdrawals. If this errors because no tax settings exist, call update_tax_settings with filing and taxYear to create them.",
+  readOnly: true,
+  inputSchema: {
+    type: "object",
+    properties: { workspaceId: { type: "integer", minimum: 1 } },
+    required: ["workspaceId"],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      filing: { type: "string" },
+      taxYear: { type: "integer" },
+      caSdiRate: { type: "number" },
+      ssWageBaseDollars: { type: "number" },
+      ficaSsRate: { type: "number" },
+      ficaMedicareRate: { type: "number" },
+      retirementEffectiveTaxRate: { type: "number" },
+    },
+  },
+  // No try/catch: a missing tax_settings row is a real error the model should
+  // see (the description names the recovery), not a silent null.
+  handler: (args, ctx) => {
+    const a = args as { workspaceId: number };
+    return ctx.tax.settingsForWorkspace(a.workspaceId);
+  },
+};
+
+// Named update_* rather than set_* deliberately: in this registry set_* means a
+// full-required upsert (set_retirement_settings, set_sensitivity_settings) while
+// update_* means "only the fields provided change" (update_expense). These are
+// partial semantics, so it carries the update_ name.
+const update_tax_settings: ToolDef = {
+  name: "update_tax_settings",
+  description:
+    "Update a workspace's tax settings. Only the fields you pass are changed; the rest keep their stored values. If no settings row exists yet, filing AND taxYear are required to create one and the other fields take their defaults. All rate fields are FRACTIONS, not percents (1.1% = 0.011).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      workspaceId: { type: "integer", minimum: 1 },
+      filing: {
+        type: "string",
+        enum: ["single", "mfj"],
+        description: "Filing status: 'single' or 'mfj' (married filing jointly).",
+      },
+      taxYear: {
+        type: "integer",
+        minimum: 2000,
+        maximum: 2100,
+        description: "Which year's tax tables this workspace is computed against.",
+      },
+      caSdiRate: {
+        type: "number",
+        minimum: 0,
+        maximum: 1,
+        description: "CA State Disability Insurance rate as a fraction (1.1% = 0.011).",
+      },
+      ssWageBaseDollars: {
+        type: "number",
+        minimum: 0,
+        description: "Annual wage cap above which Social Security tax stops, in dollars.",
+      },
+      ficaSsRate: {
+        type: "number",
+        minimum: 0,
+        maximum: 1,
+        description: "Employee Social Security rate as a fraction (6.2% = 0.062).",
+      },
+      ficaMedicareRate: {
+        type: "number",
+        minimum: 0,
+        maximum: 1,
+        description: "Employee Medicare rate as a fraction (1.45% = 0.0145).",
+      },
+      retirementEffectiveTaxRate: {
+        type: "number",
+        minimum: 0,
+        maximum: 1,
+        description: "Effective tax rate applied to traditional balances at retirement, as a fraction.",
+      },
+    },
+    required: ["workspaceId"],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: { saved: { type: "boolean" }, created: { type: "boolean" } },
+    required: ["saved", "created"],
+  },
+  handler: (args, ctx) =>
+    ctx.tax.setSettingsForWorkspace(
+      args as Parameters<typeof ctx.tax.setSettingsForWorkspace>[0],
+    ),
+};
+
+// ---------------------------------------------------------------------------
+// Budget summary
+// ---------------------------------------------------------------------------
+
+/**
+ * One workspace's budget at a glance: recurring monthly cost (with one-time
+ * spend kept separate), the per-category split, and — when the workspace has
+ * usable tax settings + tables — what take-home is left over.
+ *
+ * Composed entirely of existing primitives (computeWorkspaceTakeHome +
+ * expenseMonthlyDollars + categories.listAll) so its numbers agree with the
+ * Dashboard and Trends by construction rather than by coincidence.
+ */
+function workspaceBudgetSummary(ctx: ToolCtx, workspaceId: number): {
+  workspaceId: number;
+  workspaceName: string;
+  takeHomeAvailable: boolean;
+  monthlyTakeHomeDollars: number | null;
+  annualTakeHomeDollars: number | null;
+  monthlyRecurringExpenseDollars: number;
+  annualRecurringExpenseDollars: number;
+  oneTimeTotalDollars: number;
+  monthlyRemainingDollars: number | null;
+  monthlySavingsFromCashDollars: number | null;
+  expenseCount: number;
+  byCategory: Array<{
+    categoryId: number | null;
+    categoryName: string;
+    monthlyDollars: number;
+    annualDollars: number;
+    sharePct: number;
+  }>;
+} {
+  const ws = ctx.workspaces.get(workspaceId);
+  if (!ws) throw new Error(`Workspace ${workspaceId} not found`);
+
+  const expenses = ctx.expenses.list(workspaceId);
+  const catNameById = new Map(ctx.categories.listAll().map((c) => [c.id, c.name]));
+
+  // Recurring cost is the amortized monthly figure from budget_math (one_time
+  // → 0 there); one-time spend is reported separately so it is never silently
+  // folded into a monthly run rate.
+  let monthlyRecurringRaw = 0;
+  let oneTimeTotalRaw = 0;
+  const byCatRaw = new Map<number | null, number>();
+  for (const e of expenses) {
+    const m = expenseMonthlyDollars(e.amountDollars, e.frequency);
+    if (e.frequency === "one_time") oneTimeTotalRaw += e.amountDollars;
+    monthlyRecurringRaw += m;
+    byCatRaw.set(e.categoryId, (byCatRaw.get(e.categoryId) ?? 0) + m);
+  }
+  const monthlyRecurringExpenseDollars = round2(monthlyRecurringRaw);
+
+  let takeHomeAvailable = true;
+  let monthlyTakeHomeDollars: number | null = null;
+  let annualTakeHomeDollars: number | null = null;
+  let monthlyRemainingDollars: number | null = null;
+  let monthlySavingsFromCashDollars: number | null = null;
+  try {
+    // Same defensive shape as compute_expense_trends: a workspace with no tax
+    // settings or no tax tables for its year still gets its expense picture.
+    const r = computeWorkspaceTakeHome(ctx, workspaceId);
+    monthlyTakeHomeDollars = round2(r.breakdown.monthlyTakeHomeDollars);
+    annualTakeHomeDollars = round2(r.breakdown.annualTakeHomeDollars);
+    monthlyRemainingDollars = round2(
+      monthlyTakeHomeDollars - monthlyRecurringExpenseDollars,
+    );
+    // A USE of take-home (Roth IRA / brokerage / HYSA funded from cash), NOT a
+    // deduction from it — deliberately excluded from monthlyRemainingDollars.
+    monthlySavingsFromCashDollars = round2(r.fromCashContribDollars / 12);
+  } catch {
+    takeHomeAvailable = false;
+  }
+
+  const byCategory = [...byCatRaw.entries()]
+    .map(([categoryId, raw]) => {
+      const monthlyDollars = round2(raw);
+      return {
+        categoryId,
+        categoryName:
+          categoryId === null ? "Uncategorized" : catNameById.get(categoryId) ?? "Uncategorized",
+        monthlyDollars,
+        annualDollars: round2(monthlyDollars * 12),
+        sharePct:
+          monthlyRecurringExpenseDollars === 0
+            ? 0
+            : round2((monthlyDollars / monthlyRecurringExpenseDollars) * 100),
+      };
+    })
+    .sort((a, b) => b.monthlyDollars - a.monthlyDollars);
+
+  return {
+    workspaceId,
+    workspaceName: ws.name,
+    takeHomeAvailable,
+    monthlyTakeHomeDollars,
+    annualTakeHomeDollars,
+    monthlyRecurringExpenseDollars,
+    // Always exactly 12x the monthly figure — this is an annualized run rate,
+    // not a calendar-year total (one-time spend is not in it).
+    annualRecurringExpenseDollars: round2(monthlyRecurringExpenseDollars * 12),
+    oneTimeTotalDollars: round2(oneTimeTotalRaw),
+    monthlyRemainingDollars,
+    monthlySavingsFromCashDollars,
+    expenseCount: expenses.length,
+    byCategory,
+  };
+}
+
+const compute_budget_summary: ToolDef = {
+  name: "compute_budget_summary",
+  description:
+    "One-call budget overview for a workspace: monthly + annual recurring expense run rate, one-time spend total, the per-category split with shares, and (when tax settings exist) monthly take-home and what is left after recurring expenses. Recurring annual figures are exactly 12x monthly; one-time spend is reported only in oneTimeTotalDollars.",
+  readOnly: true,
+  inputSchema: {
+    type: "object",
+    properties: { workspaceId: { type: "integer", minimum: 1 } },
+    required: ["workspaceId"],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      workspaceId: { type: "integer" },
+      workspaceName: { type: "string" },
+      takeHomeAvailable: { type: "boolean" },
+      monthlyTakeHomeDollars: { type: "number", nullable: true },
+      annualTakeHomeDollars: { type: "number", nullable: true },
+      monthlyRecurringExpenseDollars: { type: "number" },
+      annualRecurringExpenseDollars: { type: "number" },
+      oneTimeTotalDollars: { type: "number" },
+      monthlyRemainingDollars: { type: "number", nullable: true },
+      monthlySavingsFromCashDollars: { type: "number", nullable: true },
+      expenseCount: { type: "integer" },
+      byCategory: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            categoryId: { type: "integer", nullable: true },
+            categoryName: { type: "string" },
+            monthlyDollars: { type: "number" },
+            annualDollars: { type: "number" },
+            sharePct: { type: "number" },
+          },
+        },
+      },
+    },
+    required: ["workspaceId", "takeHomeAvailable", "monthlyRecurringExpenseDollars", "byCategory"],
+  },
+  handler: (args, ctx) => {
+    const a = args as { workspaceId: number };
+    return workspaceBudgetSummary(ctx, a.workspaceId);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Transaction query tools (the `transactions` table is GLOBAL — imported
+// statement history shared by every workspace, not workspace-scoped)
+// ---------------------------------------------------------------------------
+
+const search_transactions: ToolDef = {
+  name: "search_transactions",
+  description:
+    "Search imported statement transactions. NOT workspace-scoped: the transactions table is global real-world history shared by all workspaces. Filters are optional and combined with AND. By default only charges are returned; set includeCredits to include payments and refunds. amountDollars comes back SIGNED (charges negative); the min/max filters compare absolute values.",
+  readOnly: true,
+  inputSchema: {
+    type: "object",
+    properties: {
+      merchant: {
+        type: "string",
+        maxLength: 200,
+        description: "Case-insensitive substring match against the merchant name.",
+      },
+      from: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        description: "Earliest posted date, YYYY-MM-DD, inclusive.",
+      },
+      to: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        description: "Latest posted date, YYYY-MM-DD, inclusive.",
+      },
+      categoryId: {
+        type: "integer",
+        minimum: 1,
+        description: "Restrict to one category id (see list_categories).",
+      },
+      minAmountDollars: {
+        type: "number",
+        minimum: 0,
+        description: "Smallest ABSOLUTE amount to include, in dollars (a $50 charge has absolute amount 50).",
+      },
+      maxAmountDollars: {
+        type: "number",
+        minimum: 0,
+        description: "Largest ABSOLUTE amount to include, in dollars.",
+      },
+      includeCredits: {
+        type: "boolean",
+        default: false,
+        description: "Include positive rows (payments, refunds). Default false: charges only.",
+      },
+      limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+      offset: { type: "integer", minimum: 0, default: 0 },
+    },
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      rows: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            postedDate: { type: "string" },
+            merchantRaw: { type: "string" },
+            merchantNormalized: { type: "string" },
+            amountDollars: { type: "number" },
+            categoryId: { type: "integer", nullable: true },
+            accountType: { type: "string" },
+          },
+        },
+      },
+      totalMatched: { type: "integer" },
+      returned: { type: "integer" },
+      truncated: { type: "boolean" },
+    },
+    required: ["rows", "totalMatched", "returned", "truncated"],
+  },
+  handler: (args, ctx) => {
+    const a = args as {
+      merchant?: string;
+      from?: string;
+      to?: string;
+      categoryId?: number;
+      minAmountDollars?: number;
+      maxAmountDollars?: number;
+      includeCredits?: boolean;
+      limit?: number;
+      offset?: number;
+    };
+    const limit = a.limit ?? 50;
+    const offset = a.offset ?? 0;
+    const { rows, totalMatched } = ctx.transactions.search({ ...a, limit, offset });
+    return {
+      rows,
+      totalMatched,
+      returned: rows.length,
+      // True when matches exist beyond this page — tells the model to page on
+      // with `offset` rather than treating `rows` as the whole answer.
+      truncated: offset + rows.length < totalMatched,
+    };
+  },
+};
+
+const top_merchants: ToolDef = {
+  name: "top_merchants",
+  description:
+    "Rank merchants by total charges across the global transactions table (not workspace-scoped), biggest spender first. Credits and refunds are excluded. totalDollars is POSITIVE cost. Optionally bound by posted date and/or category. Answers 'where is my money actually going'.",
+  readOnly: true,
+  inputSchema: {
+    type: "object",
+    properties: {
+      from: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        description: "Earliest posted date, YYYY-MM-DD, inclusive.",
+      },
+      to: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        description: "Latest posted date, YYYY-MM-DD, inclusive.",
+      },
+      categoryId: {
+        type: "integer",
+        minimum: 1,
+        description: "Restrict to one category id (see list_categories).",
+      },
+      limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
+    },
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      merchants: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            merchantNormalized: { type: "string" },
+            merchantRawSample: { type: "string" },
+            txnCount: { type: "integer" },
+            totalDollars: { type: "number" },
+            avgDollars: { type: "number" },
+            firstSeen: { type: "string" },
+            lastSeen: { type: "string" },
+          },
+        },
+      },
+      windowFrom: { type: "string", nullable: true },
+      windowTo: { type: "string", nullable: true },
+    },
+    required: ["merchants", "windowFrom", "windowTo"],
+  },
+  handler: (args, ctx) => {
+    const a = args as { from?: string; to?: string; categoryId?: number; limit?: number };
+    const merchants = ctx.transactions
+      .topMerchants({ from: a.from, to: a.to, categoryId: a.categoryId, limit: a.limit ?? 10 })
+      .map((m) => ({
+        ...m,
+        avgDollars: m.txnCount === 0 ? 0 : round2(m.totalDollars / m.txnCount),
+      }));
+    return { merchants, windowFrom: a.from ?? null, windowTo: a.to ?? null };
+  },
+};
+
+const compute_category_baselines: ToolDef = {
+  name: "compute_category_baselines",
+  description:
+    "Per-category spending baselines from imported statement charges (global, not workspace-scoped): the rolling monthly average over the window, the median of months WITH activity, and the window total — all POSITIVE dollars. The average divides by the full window so a category active in only 3 of 12 months smooths down. Use it to sanity-check budgeted amounts against real spend.",
+  readOnly: true,
+  inputSchema: {
+    type: "object",
+    properties: {
+      windowMonths: {
+        type: "integer",
+        minimum: 1,
+        maximum: 60,
+        default: 12,
+        description: "Length of the rolling window in months, ending at asOf. Default 12.",
+      },
+      asOf: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        description: "End of the window, YYYY-MM-DD. Defaults to the newest charge on file.",
+      },
+    },
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      asOf: { type: "string" },
+      windowMonths: { type: "integer" },
+      baselines: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            category: { type: "string" },
+            monthlyAverageDollars: { type: "number" },
+            monthlyMedianDollars: { type: "number" },
+            windowTotalDollars: { type: "number" },
+            monthsWithActivity: { type: "integer" },
+            txnCount: { type: "integer" },
+          },
+        },
+      },
+    },
+    required: ["asOf", "windowMonths", "baselines"],
+  },
+  handler: (args, ctx) => {
+    const a = args as { windowMonths?: number; asOf?: string };
+    const windowMonths = a.windowMonths ?? 12;
+    // Bound the fetch by asOf when given; rollByCategory applies the window
+    // itself, so the lower bound is left to it.
+    const rows = ctx.transactions.listChargeRowsInRange(undefined, a.asOf);
+    const catNameById = new Map(ctx.categories.listAll().map((c) => [c.id, c.name]));
+    const txns: RawTxn[] = rows.map((r) => ({
+      postedDate: r.postedDate,
+      merchantRaw: r.merchantRaw,
+      merchantNormalized: r.merchantNormalized,
+      amountDollars: r.amountDollars,
+      accountType: r.accountType as RawTxn["accountType"],
+      // The importer-assigned category wins; unmapped rows fall through to the
+      // merchant heuristic inside rollByCategory.
+      categoryHint: r.categoryId === null ? undefined : catNameById.get(r.categoryId),
+    }));
+    // Resolve asOf explicitly (same rule rollByCategory would apply) so the
+    // reported window matches the one actually computed.
+    const latestPosted = rows.reduce(
+      (latest, r) => (r.postedDate > latest ? r.postedDate : latest),
+      "",
+    );
+    const asOf =
+      a.asOf ?? (latestPosted || new Date().toISOString().slice(0, 10));
+    const baselines = rollByCategory(txns, {
+      windowMonths,
+      asOf,
+      chargesOnly: true,
+      categoryResolver: defaultMerchantCategorizer,
+    });
+    return {
+      asOf,
+      windowMonths,
+      // baseline_roller preserves the stored sign (charges are negative);
+      // negate so the tool surface reports cost as a positive number. `|| 0`
+      // normalizes the -0 that negating an exact 0 produces.
+      baselines: baselines.map((b) => ({
+        category: b.category,
+        monthlyAverageDollars: round2(-b.monthlyAverageDollars) || 0,
+        monthlyMedianDollars: round2(-b.monthlyMedianDollars) || 0,
+        windowTotalDollars: round2(-b.annualizedDollars) || 0,
+        monthsWithActivity: b.monthsWithActivity,
+        txnCount: b.txnCount,
+      })),
+    };
+  },
+};
+
+const backfill_spend_dates: ToolDef = {
+  name: "backfill_spend_dates",
+  description:
+    "Recover missing spend dates on one-time expenses across ALL workspaces by matching each to its originating statement charge (same merchant, same amount to the cent). Only fills dates that are missing — it never overwrites one the user set. Run with dryRun true first to see exactly which rows would change.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      dryRun: {
+        type: "boolean",
+        default: false,
+        description: "Preview only: compute the matches and report them without writing anything.",
+      },
+    },
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      dryRun: { type: "boolean" },
+      scanned: { type: "integer" },
+      matched: { type: "integer" },
+      changed: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "integer" },
+            label: { type: "string" },
+            spendDate: { type: "string" },
+          },
+        },
+      },
+    },
+    required: ["dryRun", "scanned", "matched", "changed"],
+  },
+  handler: (args, ctx) => {
+    const a = args as { dryRun?: boolean };
+    const dryRun = a.dryRun ?? false;
+    const r = backfillOneTimeSpendDates(ctx, { dryRun });
+    return { dryRun, ...r };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Custom page (the /custom canvas the assistant writes for the user)
+// ---------------------------------------------------------------------------
+
+const query_transactions: ToolDef = {
+  name: "query_transactions",
+  description:
+    "Aggregate imported transactions (global, not workspace-scoped). Filter by date/category/merchant/weekday, group by day|week|month|dayOfWeek|category|merchant, metric sum|count|avg of dollars (charges count positive). For raw rows use search_transactions.",
+  readOnly: true,
+  inputSchema: {
+    type: "object",
+    properties: {
+      from: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        description: "Earliest posted date, YYYY-MM-DD, inclusive.",
+      },
+      to: {
+        type: "string",
+        pattern: ISO_DATE_PATTERN,
+        description: "Latest posted date, YYYY-MM-DD, inclusive.",
+      },
+      merchant: {
+        type: "string",
+        maxLength: 200,
+        description: "Case-insensitive substring match against the merchant name.",
+      },
+      categoryId: {
+        type: "integer",
+        minimum: 1,
+        description: "Restrict to one category id (see list_categories).",
+      },
+      dayOfWeek: {
+        type: "integer",
+        minimum: 0,
+        maximum: 6,
+        description: "Only txns posted on this weekday, 0=Sunday..6=Saturday.",
+      },
+      includeCredits: {
+        type: "boolean",
+        default: false,
+        description:
+          "Include positive rows (payments, refunds), making sums NET spend. Default false: charges only.",
+      },
+      groupBy: {
+        type: "string",
+        enum: ["day", "week", "month", "dayOfWeek", "category", "merchant"],
+        description:
+          "Bucket key. 'week' keys on the Sunday starting the week; 'dayOfWeek' keys '0'..'6'; 'category' keys the category id or 'uncat'.",
+      },
+      metric: { type: "string", enum: ["sum", "count", "avg"], default: "sum" },
+      limit: { type: "integer", minimum: 1, maximum: 400, default: 100 },
+    },
+    required: ["groupBy"],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      groups: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            key: { type: "string" },
+            value: { type: "number" },
+            count: { type: "integer" },
+          },
+        },
+      },
+      groupBy: { type: "string" },
+      metric: { type: "string" },
+      totalGroups: { type: "integer" },
+      truncated: { type: "boolean" },
+    },
+    required: ["groups", "groupBy", "metric", "totalGroups", "truncated"],
+  },
+  handler: (args, ctx) => {
+    const a = args as {
+      from?: string;
+      to?: string;
+      merchant?: string;
+      categoryId?: number;
+      dayOfWeek?: number;
+      includeCredits?: boolean;
+      groupBy: "day" | "week" | "month" | "dayOfWeek" | "category" | "merchant";
+      metric?: "sum" | "count" | "avg";
+      limit?: number;
+    };
+    const metric = a.metric ?? "sum";
+    const limit = a.limit ?? 100;
+    const { rows, totalGroups } = ctx.transactions.aggregate({ ...a, metric, limit });
+    return {
+      groups: rows,
+      groupBy: a.groupBy,
+      metric,
+      totalGroups,
+      // True when buckets exist beyond this page — tells the model (and the
+      // custom page) that the chart is showing a slice, not the whole answer.
+      truncated: rows.length < totalGroups,
+    };
+  },
+};
+
+const get_custom_page: ToolDef = {
+  name: "get_custom_page",
+  description:
+    "Read the user's /custom page definition. Call with includeGuide:true BEFORE authoring or editing it to get the format guide, and to get the current definition you must rewrite in full.",
+  readOnly: true,
+  inputSchema: {
+    type: "object",
+    properties: {
+      includeGuide: {
+        type: "boolean",
+        default: false,
+        description: "Also return the ~2.5KB authoring guide for set_custom_page.",
+      },
+    },
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      exists: { type: "boolean" },
+      updatedAt: { type: "string", nullable: true },
+      definition: { type: "object", properties: {}, additionalProperties: true, nullable: true },
+      hasPrevious: { type: "boolean" },
+      guide: { type: "string" },
+    },
+    required: ["exists", "updatedAt", "definition", "hasPrevious"],
+  },
+  handler: (args, ctx) => {
+    const a = args as { includeGuide?: boolean };
+    const row = ctx.customPage.read();
+    let definition: unknown = null;
+    if (row) {
+      try {
+        definition = JSON.parse(row.definitionJson);
+      } catch {
+        // A row we can't parse is treated as no page rather than an error, so
+        // the model's recovery move is the same one it already knows: write a
+        // fresh definition.
+        definition = null;
+      }
+    }
+    return {
+      exists: definition !== null,
+      updatedAt: definition !== null ? row!.updatedAt : null,
+      definition,
+      hasPrevious: ctx.customPage.readPrev() !== null,
+      ...(a.includeGuide === true ? { guide: CUSTOM_PAGE_GUIDE } : {}),
+    };
+  },
+};
+
+const set_custom_page: ToolDef = {
+  name: "set_custom_page",
+  description:
+    "Write the user's /custom page (auto-applies in chat; the page updates live). action:set replaces it and needs title+queries+render TOGETHER in one call (partial payloads are rejected) — call get_custom_page{includeGuide:true} first for the exact shape; reset blanks it; revert restores the previous version.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["set", "reset", "revert"],
+        description: "set replaces the page, reset blanks it, revert undoes the last write.",
+      },
+      title: { type: "string", minLength: 1, maxLength: MAX_TITLE_CHARS },
+      note: { type: "string", maxLength: MAX_NOTE_CHARS },
+      queries: {
+        type: "array",
+        maxItems: MAX_QUERIES,
+        items: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              pattern: QUERY_ID_PATTERN,
+              description: "Identifier the render body reads results under: data.<id>.",
+            },
+            tool: { type: "string", enum: [...CUSTOM_PAGE_QUERY_TOOLS] },
+            args: {
+              type: "object",
+              properties: {},
+              additionalProperties: true,
+              description:
+                'Arguments for that tool, validated against its own schema now. A value of exactly "$WORKSPACE_ID" becomes the active workspace id at page load.',
+            },
+          },
+          required: ["id", "tool"],
+          additionalProperties: false,
+        },
+      },
+      render: {
+        type: "string",
+        maxLength: MAX_RENDER_CHARS,
+        // The model never sees outputSchema or the guide unless it fetches one,
+        // so the whole render contract has to fit here or pages come back blank.
+        description:
+          "BODY ONLY of function (root, data, bk) — do NOT wrap it in 'function render(...) {}'. " +
+          "data[queryId] holds that query's result (or {error}); read defensively. Helpers: " +
+          "bk.el(tag,attrs,children), bk.formatDollars(n), bk.palette, bk.colorFor(i), " +
+          "bk.lineChart(parent,{series:[{label,points:[{x,y}]}],yFormat,height}), " +
+          "bk.barChart(parent,{bars:[{label,value,color}],yFormat,height,horizontal}), " +
+          "bk.table(parent,{columns:[{key,label,align,format}],rows}), bk.note(parent,text). " +
+          "Synchronous, no network, no timers. Runs only in a sandboxed iframe.",
+      },
+    },
+    required: ["action"],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object",
+    properties: {
+      saved: { type: "boolean" },
+      action: { type: "string" },
+      updatedAt: { type: "string", nullable: true },
+      hadDefinition: { type: "boolean" },
+      reverted: { type: "boolean" },
+    },
+    required: ["saved", "action"],
+  },
+  handler: (args, ctx) => {
+    const a = args as { action: "set" | "reset" | "revert" };
+    if (a.action === "reset") {
+      const { hadDefinition } = ctx.tx(() => ctx.customPage.reset());
+      return { saved: true, action: "reset", hadDefinition, updatedAt: null };
+    }
+    if (a.action === "revert") {
+      const { reverted, updatedAt } = ctx.tx(() => ctx.customPage.revert());
+      return { saved: reverted, action: "revert", reverted, updatedAt };
+    }
+    // Validate (including every query's args against its target tool's own
+    // schema) BEFORE opening the transaction, so a rejected write never
+    // touches the undo snapshot. The lookup is injected because custom_page.ts
+    // must not import this module back.
+    const definition = validateCustomPageDefinition(a, (name) =>
+      ALL_TOOLS.find((t) => t.name === name),
+    );
+    const json = serializeCustomPageDefinition(definition);
+    // The snapshot + write pair is atomic: a user Stop mid-turn lands either
+    // side of the COMMIT, never inside it, so the page always holds a whole
+    // definition.
+    const { updatedAt } = ctx.tx(() => ctx.customPage.write(json));
+    return { saved: true, action: "set", updatedAt };
+  },
+};
+
 /** All tool definitions, exported as a flat array so callers can build the
  *  ToolRegistry with whichever subset they want. Adding a new tool: define
  *  it above and append the export here. */
@@ -2960,4 +3875,15 @@ export const ALL_TOOLS: ToolDef[] = [
   auto_categorize_expenses,
   dedupe_expenses,
   list_statements,
+  list_categories,
+  get_tax_settings,
+  update_tax_settings,
+  compute_budget_summary,
+  search_transactions,
+  top_merchants,
+  compute_category_baselines,
+  backfill_spend_dates,
+  query_transactions,
+  get_custom_page,
+  set_custom_page,
 ];

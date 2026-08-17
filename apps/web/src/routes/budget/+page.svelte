@@ -325,11 +325,16 @@
   const totalGrossAnnual = $derived(incomes.reduce((s, i) => s + i.grossAnnualDollars, 0));
 
   // The "% of salary" 401k knob and employer-match-% knob both key off the
-  // PRIMARY filer's taxed (W-2) gross. Mirrors the same selector used by
-  // compute_retirement in the API.
+  // taxed (W-2) gross of the filer who OWNS the account (savings.filingRole).
+  // Mirrors the same per-owner selector used by compute_retirement in the API.
   const primaryTaxedGrossAnnual = $derived(
     incomes
       .filter((i) => i.filingRole === "primary" && i.taxStatus === "taxed")
+      .reduce((s, i) => s + i.grossAnnualDollars, 0)
+  );
+  const spouseTaxedGrossAnnual = $derived(
+    incomes
+      .filter((i) => i.filingRole === "spouse" && i.taxStatus === "taxed")
       .reduce((s, i) => s + i.grossAnnualDollars, 0)
   );
 
@@ -337,7 +342,10 @@
   // Delegates to the core helper so the UI shows what the projection will
   // actually use — single source of truth for the math.
   function effectiveMonthlyDollars(s: SavingsItem): number {
-    return effectiveMonthlyContributionDollars(s, primaryTaxedGrossAnnual);
+    return effectiveMonthlyContributionDollars(
+      s,
+      s.filingRole === "spouse" ? spouseTaxedGrossAnnual : primaryTaxedGrossAnnual
+    );
   }
 
   async function addIncome(): Promise<void> {
@@ -1176,6 +1184,9 @@
       title="Savings & investments"
       deck="HYSA, brokerage, 401k, Roth IRA, HSA — anything where money accumulates instead of leaves."
     >
+      <!-- 9 fixed-layout columns need ~780px; scroll the wrapper rather than
+           let squeezed headers overflow into their neighbors. -->
+      <div style="overflow-x: auto">
       <table class="bk-table bk-table-savings" data-testid="savings-table">
         <colgroup>
           <col class="col-account" />
@@ -1503,6 +1514,7 @@
           {/if}
         </tfoot>
       </table>
+      </div>
     </EdSection>
 
     <div class="ed-footnotes" data-testid="footnotes">

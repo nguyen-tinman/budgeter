@@ -3,6 +3,7 @@
 
 import type {
   AuditLogRepo,
+  CustomPageRepo,
   ExpenseRepo,
   IncomeRepo,
   RetirementRepo,
@@ -34,10 +35,53 @@ function workspaceRepo(db: DatabaseSync): WorkspaceRepo {
         )
         .get(id) as ReturnType<WorkspaceRepo["get"]>) ?? null,
     create: ({ name, kind, notes }) => {
-      const r = db
-        .prepare("INSERT INTO workspaces (name, kind, notes) VALUES (?, ?, ?)")
-        .run(name, kind, notes ?? null);
-      return { id: Number(r.lastInsertRowid) };
+      // A workspace with no tax_settings row is unusable: compute_take_home,
+      // compute_sensitivity and compute_retirement all read it and throw when
+      // it's missing. Seed one in the same transaction as the workspace insert,
+      // copying the 'Current' workspace's row when there is one so a new
+      // scenario inherits the household's filing status / year / rates, else
+      // falling back to the DDL defaults. BEGIN/COMMIT run as prepared
+      // statements (node:sqlite's DatabaseSync has no `transaction(fn)`),
+      // following clone() below.
+      db.prepare("BEGIN").run();
+      try {
+        const r = db
+          .prepare("INSERT INTO workspaces (name, kind, notes) VALUES (?, ?, ?)")
+          .run(name, kind, notes ?? null);
+        const id = Number(r.lastInsertRowid);
+
+        const copied = db
+          .prepare(
+            `INSERT INTO tax_settings
+               (workspace_id, filing_status, tax_year, ca_sdi_rate,
+                ss_wage_base_dollars, fica_ss_rate, fica_medicare_rate,
+                retirement_effective_tax_rate)
+             SELECT ?, t.filing_status, t.tax_year, t.ca_sdi_rate,
+                    t.ss_wage_base_dollars, t.fica_ss_rate, t.fica_medicare_rate,
+                    t.retirement_effective_tax_rate
+               FROM tax_settings t
+               JOIN workspaces w ON w.id = t.workspace_id
+              WHERE w.kind = 'current'
+              ORDER BY w.id
+              LIMIT 1`,
+          )
+          .run(id);
+
+        if (Number(copied.changes) === 0) {
+          // No 'Current' workspace to inherit from — DDL defaults for the rate
+          // columns, single filer, this calendar year.
+          db.prepare(
+            `INSERT INTO tax_settings (workspace_id, filing_status, tax_year)
+               VALUES (?, 'single', ?)`,
+          ).run(id, new Date().getFullYear());
+        }
+
+        db.prepare("COMMIT").run();
+        return { id };
+      } catch (e) {
+        db.prepare("ROLLBACK").run();
+        throw e;
+      }
     },
     rename: (id, newName) => {
       const r = db
@@ -233,7 +277,7 @@ function incomeRepo(db: DatabaseSync): IncomeRepo {
           args.label,
           round2(args.grossAnnualDollars),
           args.taxStatus,
-          args.isFederalIncomeTax ?? true ? 1 : 0,
+          (args.isFederalIncomeTax ?? true) ? 1 : 0,
           args.filingRole ?? "primary",
         );
       return { id: Number(r.lastInsertRowid) };
@@ -327,10 +371,60 @@ function taxRepo(db: DatabaseSync): TaxRepo {
         | undefined;
       if (!row) {
         throw new Error(
-          `No tax_settings row for workspace ${workspaceId}. Initialize via /api/workspaces.`,
+          `No tax_settings row for workspace ${workspaceId}. Create one with the update_tax_settings tool or the Setup page.`,
         );
       }
       return row;
+    },
+    setSettingsForWorkspace: (args) => {
+      const exists = db
+        .prepare("SELECT 1 AS one FROM tax_settings WHERE workspace_id = ?")
+        .get(args.workspaceId) as { one: number } | undefined;
+
+      // Column ⇄ arg pairing, shared by both branches so the two stay in sync.
+      const cols: Array<[string, string | number | undefined]> = [
+        ["filing_status", args.filing],
+        ["tax_year", args.taxYear],
+        ["ca_sdi_rate", args.caSdiRate],
+        ["ss_wage_base_dollars", args.ssWageBaseDollars],
+        ["fica_ss_rate", args.ficaSsRate],
+        ["fica_medicare_rate", args.ficaMedicareRate],
+        ["retirement_effective_tax_rate", args.retirementEffectiveTaxRate],
+      ];
+      const supplied = cols.filter(([, v]) => v !== undefined) as Array<
+        [string, string | number]
+      >;
+
+      if (exists) {
+        // Partial update: touch ONLY the supplied columns.
+        if (supplied.length === 0) return { saved: false, created: false };
+        const sets = supplied.map(([c]) => `${c} = ?`);
+        const vals: Array<string | number> = supplied.map(([, v]) => v);
+        vals.push(args.workspaceId);
+        const r = db
+          .prepare(`UPDATE tax_settings SET ${sets.join(", ")} WHERE workspace_id = ?`)
+          .run(...vals);
+        return { saved: Number(r.changes) > 0, created: false };
+      }
+
+      // Insert branch. filing_status and tax_year are NOT NULL with no schema
+      // default, so a create must supply both.
+      if (args.filing === undefined || args.taxYear === undefined) {
+        throw new Error(
+          `No tax_settings row exists for workspace ${args.workspaceId}; creating one requires both "filing" and "taxYear".`,
+        );
+      }
+      // Only the supplied columns are listed, so every omitted column takes
+      // its schema DEFAULT. (Deliberately NOT an ON CONFLICT upsert: excluded.*
+      // would overwrite unspecified columns on the update path.)
+      const names = supplied.map(([c]) => c);
+      const r = db
+        .prepare(
+          `INSERT INTO tax_settings (workspace_id, ${names.join(", ")})
+           VALUES (${["?", ...names.map(() => "?")].join(", ")})`,
+        )
+        .run(args.workspaceId, ...supplied.map(([, v]) => v));
+      return { saved: Number(r.changes) > 0, created: true };
     },
   };
 }
@@ -550,6 +644,76 @@ function categoriesRepo(db: DatabaseSync) {
   };
 }
 
+/** Escape a user-supplied substring for use inside a LIKE pattern. The LIKE
+ *  wildcards (% and _) and the escape character itself are neutralized, so a
+ *  merchant search for "50%_off" matches that literal text instead of turning
+ *  into a wildcard. Pair with `ESCAPE '\'` in the SQL. */
+function likeEscape(s: string): string {
+  return s.replace(/[\\%_]/g, (m) => `\\${m}`);
+}
+
+/** Shared WHERE-clause builder for the transaction query surface (search +
+ *  topMerchants + aggregate). Every filter is optional and AND-ed;
+ *  `includeCredits` defaults to false, i.e. charges only. Amount bounds
+ *  compare against the ABSOLUTE value so callers reason in positive magnitudes
+ *  regardless of the stored sign. */
+function txnFilterClauses(args: {
+  merchant?: string;
+  from?: string;
+  to?: string;
+  categoryId?: number;
+  minAmountDollars?: number;
+  maxAmountDollars?: number;
+  includeCredits?: boolean;
+  dayOfWeek?: number;
+}): { clauses: string[]; params: Array<string | number> } {
+  const clauses: string[] = [];
+  const params: Array<string | number> = [];
+  if (args.includeCredits !== true) clauses.push("amount_dollars < 0");
+  if (args.merchant !== undefined && args.merchant !== "") {
+    // merchant_normalized is already lowercase; merchant_raw is not, so lower()
+    // it to make the substring match case-insensitive on both forms.
+    const pattern = `%${likeEscape(args.merchant.toLowerCase())}%`;
+    clauses.push(
+      `(merchant_normalized LIKE ? ESCAPE '\\' OR lower(merchant_raw) LIKE ? ESCAPE '\\')`,
+    );
+    params.push(pattern, pattern);
+  }
+  if (args.from !== undefined) { clauses.push("posted_date >= ?"); params.push(args.from); }
+  if (args.to !== undefined) { clauses.push("posted_date <= ?"); params.push(args.to); }
+  if (args.categoryId !== undefined) { clauses.push("category_id = ?"); params.push(args.categoryId); }
+  if (args.minAmountDollars !== undefined) {
+    clauses.push("abs(amount_dollars) >= ?");
+    params.push(args.minAmountDollars);
+  }
+  if (args.maxAmountDollars !== undefined) {
+    clauses.push("abs(amount_dollars) <= ?");
+    params.push(args.maxAmountDollars);
+  }
+  if (args.dayOfWeek !== undefined) {
+    // posted_date is a date-only 'YYYY-MM-DD' string, so strftime('%w') is
+    // timezone-free and deterministic. 0=Sunday..6=Saturday, SQLite's own
+    // numbering — the tool schema documents the same convention.
+    clauses.push("CAST(strftime('%w', posted_date) AS INTEGER) = ?");
+    params.push(args.dayOfWeek);
+  }
+  return { clauses, params };
+}
+
+/** SQL expression producing the grouping key for each `groupBy` mode. Chosen
+ *  from this fixed map and NEVER built from caller input, so the group
+ *  expression can't carry injected SQL (the schema enum is the outer gate;
+ *  this is the inner one). `week` keys on the Sunday that starts the week, so
+ *  the key stays a sortable YYYY-MM-DD date. */
+const TXN_GROUP_EXPR = {
+  day: "posted_date",
+  week: "date(posted_date, '-' || strftime('%w', posted_date) || ' days')",
+  month: "substr(posted_date, 1, 7)",
+  dayOfWeek: "strftime('%w', posted_date)",
+  category: "COALESCE(CAST(category_id AS TEXT), 'uncat')",
+  merchant: "merchant_normalized",
+} as const;
+
 function transactionRepo(db: DatabaseSync) {
   return {
     monthlySumsByCategory(months: number) {
@@ -651,6 +815,182 @@ function transactionRepo(db: DatabaseSync) {
         postedDate: string;
         amountDollars: number;
       }>;
+    },
+    listChargeRowsInRange(from?: string, to?: string) {
+      // listChargeRows widened with category + account, and bounded by an
+      // optional posted_date window (inclusive both ends — posted_date is
+      // YYYY-MM-DD text, so lexical comparison is date comparison and the
+      // idx_txn_date index applies).
+      const clauses = ["amount_dollars < 0"];
+      const params: Array<string> = [];
+      if (from !== undefined) { clauses.push("posted_date >= ?"); params.push(from); }
+      if (to !== undefined) { clauses.push("posted_date <= ?"); params.push(to); }
+      return db
+        .prepare(
+          `SELECT merchant_raw        AS merchantRaw,
+                  merchant_normalized AS merchantNormalized,
+                  posted_date         AS postedDate,
+                  amount_dollars      AS amountDollars,
+                  category_id         AS categoryId,
+                  account_type        AS accountType
+             FROM transactions
+            WHERE ${clauses.join(" AND ")}
+            ORDER BY posted_date`,
+        )
+        .all(...params) as Array<{
+        merchantRaw: string;
+        merchantNormalized: string;
+        postedDate: string;
+        amountDollars: number;
+        categoryId: number | null;
+        accountType: string;
+      }>;
+    },
+    search(args: {
+      merchant?: string;
+      from?: string;
+      to?: string;
+      categoryId?: number;
+      minAmountDollars?: number;
+      maxAmountDollars?: number;
+      includeCredits?: boolean;
+      limit: number;
+      offset: number;
+    }) {
+      const { clauses, params } = txnFilterClauses(args);
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const countRow = db
+        .prepare(`SELECT COUNT(*) AS n FROM transactions ${where}`)
+        .get(...params) as { n: number } | undefined;
+      const rows = db
+        .prepare(
+          `SELECT posted_date         AS postedDate,
+                  merchant_raw        AS merchantRaw,
+                  merchant_normalized AS merchantNormalized,
+                  amount_dollars      AS amountDollars,
+                  category_id         AS categoryId,
+                  account_type        AS accountType
+             FROM transactions
+            ${where}
+            ORDER BY posted_date DESC, id DESC
+            LIMIT ? OFFSET ?`,
+        )
+        .all(...params, args.limit, args.offset) as Array<{
+        postedDate: string;
+        merchantRaw: string;
+        merchantNormalized: string;
+        amountDollars: number;
+        categoryId: number | null;
+        accountType: string;
+      }>;
+      return {
+        // round2 at the boundary (money.ts contract); the sign is preserved so
+        // callers can tell a charge from a credit.
+        rows: rows.map((r) => ({ ...r, amountDollars: round2(r.amountDollars) })),
+        totalMatched: countRow?.n ?? 0,
+      };
+    },
+    topMerchants(args: {
+      from?: string;
+      to?: string;
+      categoryId?: number;
+      limit: number;
+    }) {
+      // Charges only — a merchant's "spend" never nets against refunds here
+      // (same convention as monthlySumsByCategory).
+      const { clauses, params } = txnFilterClauses({
+        from: args.from,
+        to: args.to,
+        categoryId: args.categoryId,
+        includeCredits: false,
+      });
+      const rows = db
+        .prepare(
+          `SELECT merchant_normalized AS merchantNormalized,
+                  MIN(merchant_raw)   AS merchantRawSample,
+                  COUNT(*)            AS txnCount,
+                  SUM(-amount_dollars) AS totalDollars,
+                  MIN(posted_date)    AS firstSeen,
+                  MAX(posted_date)    AS lastSeen
+             FROM transactions
+            WHERE ${clauses.join(" AND ")}
+            GROUP BY merchant_normalized
+            ORDER BY totalDollars DESC
+            LIMIT ?`,
+        )
+        .all(...params, args.limit) as Array<{
+        merchantNormalized: string;
+        merchantRawSample: string;
+        txnCount: number;
+        totalDollars: number;
+        firstSeen: string;
+        lastSeen: string;
+      }>;
+      return rows.map((r) => ({ ...r, totalDollars: round2(r.totalDollars) }));
+    },
+    aggregate(args: {
+      merchant?: string;
+      from?: string;
+      to?: string;
+      categoryId?: number;
+      minAmountDollars?: number;
+      maxAmountDollars?: number;
+      includeCredits?: boolean;
+      dayOfWeek?: number;
+      groupBy: keyof typeof TXN_GROUP_EXPR;
+      metric: "sum" | "count" | "avg";
+      limit: number;
+    }) {
+      const { clauses, params } = txnFilterClauses(args);
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const groupExpr = TXN_GROUP_EXPR[args.groupBy];
+      // Sign convention: charges are stored negative, so -amount_dollars is
+      // positive spend. With includeCredits the sum becomes NET spend (a
+      // refund subtracts), which is the point of that flag.
+      //
+      // Time buckets read as a series and sort by key; category/merchant
+      // buckets read as a ranking and sort by size.
+      const orderBy =
+        args.groupBy === "category" || args.groupBy === "merchant"
+          ? "sumDollars DESC"
+          : "key ASC";
+      const rows = db
+        .prepare(
+          `SELECT ${groupExpr}        AS key,
+                  COUNT(*)             AS cnt,
+                  SUM(-amount_dollars) AS sumDollars,
+                  AVG(-amount_dollars) AS avgDollars
+             FROM transactions
+            ${where}
+            GROUP BY key
+            ORDER BY ${orderBy}
+            LIMIT ?`,
+        )
+        .all(...params, args.limit) as Array<{
+        key: string;
+        cnt: number;
+        sumDollars: number;
+        avgDollars: number;
+      }>;
+      // COUNT over the grouped subquery: how many buckets the filter produced
+      // in total, so the caller can tell a truncated page from a whole answer.
+      const totalRow = db
+        .prepare(
+          `SELECT COUNT(*) AS n
+             FROM (SELECT 1 FROM transactions ${where} GROUP BY ${groupExpr})`,
+        )
+        .get(...params) as { n: number } | undefined;
+      return {
+        rows: rows.map((r) => ({
+          key: String(r.key),
+          value:
+            args.metric === "count"
+              ? r.cnt
+              : round2(args.metric === "avg" ? r.avgDollars : r.sumDollars),
+          count: r.cnt,
+        })),
+        totalGroups: totalRow?.n ?? 0,
+      };
     },
     totalCount() {
       const row = db
@@ -788,6 +1128,168 @@ export function appSettingsRepo(db: DatabaseSync): AppSettingsRepo {
   };
 }
 
+/** One rendered chat bubble, as the panel draws it. Mirrors ChatPanel's
+ *  ChatMessage minus the transient fields (phase, pendingActions, setupCta) —
+ *  see migration 012 for why those are deliberately not persisted. */
+export interface ChatLogMessage {
+  role: "user" | "assistant" | "system";
+  text: string;
+  tools?: Array<{ name: string; count?: number }>;
+  step?: boolean;
+  stopped?: boolean;
+  compactionNotice?: boolean;
+}
+
+/** The stored transcript. `replace` is the only writer: the panel owns the
+ *  rendered log and hands us the whole thing after each completed turn, which
+ *  keeps the stored copy byte-identical to what the user is looking at instead
+ *  of reconstructing it from model-facing messages. */
+export interface ChatLogRepo {
+  list(): ChatLogMessage[];
+  replace(messages: ChatLogMessage[]): void;
+  clear(): void;
+}
+
+export function chatLogRepo(db: DatabaseSync): ChatLogRepo {
+  return {
+    list() {
+      const rows = db
+        .prepare(
+          `SELECT role, text, tools_json AS toolsJson, is_step AS isStep, stopped, compaction
+             FROM chat_log ORDER BY seq ASC, id ASC`,
+        )
+        .all() as Array<{
+        role: string;
+        text: string;
+        toolsJson: string | null;
+        isStep: number;
+        stopped: number;
+        compaction: number;
+      }>;
+      return rows.map((r) => {
+        const msg: ChatLogMessage = {
+          role: r.role as ChatLogMessage["role"],
+          text: r.text,
+        };
+        if (r.toolsJson) {
+          try {
+            const parsed = JSON.parse(r.toolsJson) as ChatLogMessage["tools"];
+            if (Array.isArray(parsed) && parsed.length > 0) msg.tools = parsed;
+          } catch {
+            // A malformed chip list must not cost the user their transcript.
+          }
+        }
+        if (r.isStep) msg.step = true;
+        if (r.stopped) msg.stopped = true;
+        if (r.compaction) msg.compactionNotice = true;
+        return msg;
+      });
+    },
+    replace(messages) {
+      // Whole-log replace rather than append: the panel folds chips into
+      // counted ones ("4x set_custom_page") and merges consecutive steps as a
+      // turn proceeds, so earlier rows change after they were first written.
+      // Appending would drift from what is on screen.
+      db.exec("BEGIN");
+      try {
+        db.exec("DELETE FROM chat_log");
+        const ins = db.prepare(
+          `INSERT INTO chat_log (seq, role, text, tools_json, is_step, stopped, compaction)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        );
+        messages.forEach((m, i) => {
+          ins.run(
+            i,
+            m.role,
+            m.text ?? "",
+            m.tools && m.tools.length > 0 ? JSON.stringify(m.tools) : null,
+            m.step ? 1 : 0,
+            m.stopped ? 1 : 0,
+            m.compactionNotice ? 1 : 0,
+          );
+        });
+        db.exec("COMMIT");
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
+    },
+    clear() {
+      db.exec("DELETE FROM chat_log");
+    },
+  };
+}
+
+/** The two `app_settings` keys holding the /custom page document. `.prev` is
+ *  the one-step undo snapshot; the page is blank when `.def` is absent. */
+const CUSTOM_PAGE_KEY = "customPage.def";
+const CUSTOM_PAGE_PREV_KEY = "customPage.prev";
+
+/** CustomPageRepo over `app_settings` — same upsert pattern as
+ *  appSettingsRepo, narrowed to these two keys so the tool surface can't
+ *  reach the rest of the KV table. The multi-statement methods rely on the
+ *  handler's ctx.tx() for atomicity (a half-applied snapshot+write would lose
+ *  the user's undo). */
+function customPageRepo(db: DatabaseSync): CustomPageRepo {
+  const get = (key: string) =>
+    db
+      .prepare("SELECT value, updated_at AS updatedAt FROM app_settings WHERE key = ?")
+      .get(key) as { value: string; updatedAt: string } | undefined;
+  const put = (key: string, value: string) => {
+    db.prepare(
+      `INSERT INTO app_settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+    ).run(key, value);
+  };
+  const drop = (key: string) => {
+    db.prepare("DELETE FROM app_settings WHERE key = ?").run(key);
+  };
+  return {
+    read() {
+      const row = get(CUSTOM_PAGE_KEY);
+      return row ? { definitionJson: row.value, updatedAt: row.updatedAt } : null;
+    },
+    readPrev() {
+      const row = get(CUSTOM_PAGE_PREV_KEY);
+      return row ? { definitionJson: row.value } : null;
+    },
+    write(definitionJson) {
+      const current = get(CUSTOM_PAGE_KEY);
+      // Blank is the ABSENCE of a key, so a first write leaves no snapshot to
+      // undo to: `hasPrevious` stays false and the page offers "Reset to
+      // blank" instead of "Undo last change".
+      if (current) put(CUSTOM_PAGE_PREV_KEY, current.value);
+      else drop(CUSTOM_PAGE_PREV_KEY);
+      put(CUSTOM_PAGE_KEY, definitionJson);
+      return { updatedAt: get(CUSTOM_PAGE_KEY)!.updatedAt };
+    },
+    reset() {
+      const current = get(CUSTOM_PAGE_KEY);
+      if (!current) return { hadDefinition: false };
+      put(CUSTOM_PAGE_PREV_KEY, current.value);
+      drop(CUSTOM_PAGE_KEY);
+      return { hadDefinition: true };
+    },
+    revert() {
+      const prev = get(CUSTOM_PAGE_PREV_KEY);
+      if (!prev) return { reverted: false, updatedAt: null };
+      const current = get(CUSTOM_PAGE_KEY);
+      // Swap, not restore: between two real definitions, pressing undo twice
+      // toggles back and forth instead of dead-ending.
+      //
+      // Reverting a RESET is the one asymmetric case. The page is blank, so
+      // there is no current value to snapshot, and blank is represented as the
+      // key being ABSENT — indistinguishable from "no snapshot exists". The
+      // definition comes back but `hasPrevious` goes false, so Undo disables
+      // until the next write. Re-blanking is still one click away via Reset.
+      if (current) put(CUSTOM_PAGE_PREV_KEY, current.value);
+      else drop(CUSTOM_PAGE_PREV_KEY);
+      put(CUSTOM_PAGE_KEY, prev.value);
+      return { reverted: true, updatedAt: get(CUSTOM_PAGE_KEY)!.updatedAt };
+    },
+  };
+}
+
 /** Build a ToolCtx backed by the given DB handle and source label. */
 export function buildToolCtx(
   db: DatabaseSync,
@@ -806,6 +1308,7 @@ export function buildToolCtx(
     categories: categoriesRepo(db),
     transactions: transactionRepo(db),
     statementImports: statementImportsRepo(db),
+    customPage: customPageRepo(db),
     web: opts.web ?? defaultWebFetcher(),
     source,
     tx<T>(fn: () => T): T {

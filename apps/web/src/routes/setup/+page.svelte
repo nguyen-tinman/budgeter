@@ -29,6 +29,8 @@
 
   let models = $state<LlamaModelsResponse | null>(null);
   let modelError = $state<string | null>(null);
+  /** No GGUF on disk yet ⇒ the one-click setup IS the primary action here. */
+  const anyModelPresent = $derived(!!models?.models.some((m) => m.present));
 
   // Tax-table state: sourced ENTIRELY from list_tax_tables (the DB), never
   // hardcoded. The dropdowns enumerate only the (year, jurisdiction, filing)
@@ -261,7 +263,7 @@
 
 <article class="ed-article">
   <PageHead
-    section="Section VI"
+    section="Section VII"
     kicker="The Workshop"
     title="System"
     rightLabel="Setup"
@@ -310,7 +312,27 @@
       {#if llama?.backendWarning}
         <p class="bk-text" style="color: var(--warning); margin: -8px 0 14px; font-size: 13px" data-testid="llama-backend-warning">{llama.backendWarning}</p>
       {/if}
-      {#if llama?.error}
+      {#if llama?.action}
+        <!-- The launcher ran out of rungs: every model on disk needs a GPU and
+             the GPU is unavailable. Offer the one download that fixes it rather
+             than leaving the user to read a stderr tail. -->
+        <div
+          data-testid="llama-action"
+          style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 0 0 14px; padding: 12px 14px; border: 1px solid var(--warning); border-radius: 10px"
+        >
+          <p class="bk-text" style="margin: 0; flex: 1; min-width: 260px; font-size: 13px">{llama.action.message}</p>
+          <button
+            type="button"
+            class="bk-btn bk-btn-sm"
+            data-testid="llama-action-install"
+            disabled={setup?.overall === "running"}
+            onclick={() => startSetup(llama!.action!.modelId)}
+          >
+            <Icon name="download" size={12} />
+            {setup?.overall === "running" ? "Downloading…" : `Install ${llama.action.label}`}
+          </button>
+        </div>
+      {:else if llama?.error}
         <p class="bk-text" style="color: var(--negative); margin: 0 0 14px" data-testid="llama-error">{llama.error}</p>
       {/if}
 
@@ -356,7 +378,8 @@
                   />
                   <span>
                     <span style="font-family: var(--font-display); font-size: 16px; font-weight: 500">{m.label}</span>
-                    {#if m.sizeRank > 1}<Badge>smarter</Badge>{:else}<Badge>default</Badge>{/if}
+                    {#if m.sizeRank > 1}<Badge>smarter</Badge>{:else}<Badge>lighter</Badge>{/if}
+                    {#if models.recommended === m.id}<Badge>recommended</Badge>{/if}
                     <span class="bk-text-3" style="display: block; font-size: 12px; margin-top: 2px">{m.blurb}</span>
                   </span>
                 </label>
@@ -372,14 +395,19 @@
                     disabled={setup?.overall === "running"}
                     onclick={() => startSetup(m.id)}
                   >
-                    <Icon name="refresh" size={12} />
+                    <Icon name="download" size={12} />
                     {setup?.overall === "running" && setupModelId === m.id ? "Downloading…" : `Download (${m.label})`}
                   </button>
                 {/if}
               </div>
             {/each}
           </div>
-          <p class="bk-text-3" style="font-size: 12px; margin-top: 10px; font-style: italic">
+          {#if models.recommendedReason}
+            <p class="bk-text-3" style="font-size: 12px; margin-top: 10px" data-testid="model-recommendation">
+              {models.recommendedReason}
+            </p>
+          {/if}
+          <p class="bk-text-3" style="font-size: 12px; margin-top: 6px; font-style: italic">
             Selecting a downloaded model restarts the assistant onto it and remembers it for next launch. If both are present, the larger (smarter) model is the default.
           </p>
         {:else}
@@ -389,9 +417,11 @@
 
       <div class="ed-cols" data-cols="2">
         <div data-testid="setup-pane">
-          <div class="bk-eyebrow" style="margin-bottom: 10px">One-click setup</div>
+          <div class="bk-eyebrow" style="margin-bottom: 10px; display: inline-flex; align-items: center; gap: 6px">
+            <Icon name="sparkles" size={13} /> One-click setup
+          </div>
           <p class="bk-text" style="margin-bottom: 14px">
-            Downloads the latest llama.cpp build (Vulkan-preferred, CUDA / CPU fallback), then the bundled Qwen3.5-2B-MTP GGUF. Re-runs are idempotent — skips anything already on disk. Use the per-model Download buttons above to also fetch the smarter 4B.
+            Downloads the latest llama.cpp build (Vulkan-preferred, CUDA / CPU fallback), then the bundled Qwen3.5‑2B‑MTP GGUF. Re-runs are idempotent — skips anything already on disk. Use the per-model Download buttons above to also fetch the smarter 4B.
           </p>
 
           {#if setup}
@@ -430,13 +460,13 @@
 
           <button
             type="button"
-            class="bk-btn bk-btn-sm"
+            class="bk-btn bk-btn-sm {anyModelPresent ? '' : 'bk-btn-primary'}"
             style="margin-top: 10px"
             data-testid="setup-start"
             disabled={setup?.overall === "running"}
             onclick={() => startSetup()}
           >
-            <Icon name="refresh" size={12} />
+            <Icon name={anyModelPresent ? "refresh" : "download"} size={12} />
             {setup?.overall === "running" ? "Running…" : setup?.overall === "done" ? "Re-run setup" : "Set up local LLM"}
           </button>
           {#if setup?.overall === "error" || setup?.overall === "done"}
@@ -463,7 +493,7 @@
         <div>
           <div class="bk-eyebrow" style="margin-bottom: 10px">Tips</div>
           <p class="bk-text" style="margin-bottom: 8px">
-            Sampler + binary settings (temperature, top-K, top-P, context length, GPU layers, etc.) come from <code class="bk-mono">llama_profiles</code> and are editable via the API.
+            Sampler + binary settings (temperature, top‑K, top‑P, context length, GPU layers, etc.) come from <code class="bk-mono">llama_profiles</code> and are editable via the API.
           </p>
           <p class="bk-text">
             In dev mode (<code class="bk-mono">LLAMA_SERVER_URL</code> set) the launcher reports "external" and won't spawn a subprocess.
