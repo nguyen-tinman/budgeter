@@ -54,6 +54,7 @@ import {
   openDb,
   buildToolCtx,
   snapshotForUndo,
+  discardUndoSnapshot,
   appSettingsRepo,
   chatLogRepo,
   type ChatLogMessage,
@@ -1468,6 +1469,9 @@ interface PreparedTurn {
    *  the newest user message; everything the loop appends goes after that, so
    *  the index stays valid for the life of the request. */
   contextIndex: number | null;
+  /** Snapshot taken at the start of this request, if any. Discarded at the
+   *  end of the turn unless a successful mutation actually landed. */
+  undoSnapshotId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1846,18 +1850,19 @@ async function prepareTurn(
   const db = openDb();
   const ctx = buildToolCtx(db, "in_app_llm");
 
-  // Undo point for THIS user turn, taken before anything runs. Skipped when the
-  // request carries approvedActions: that is the user answering an approval card
-  // mid-turn, not starting a new one, and snapshotting there would both waste an
-  // undo slot and let undo land in the middle of a plan the user already OK'd.
-  if (!body.approvedActions || body.approvedActions.length === 0) {
-    try {
-      snapshotForUndo(typeof body.message === "string" ? body.message : "");
-    } catch (e) {
-      // An undo point is a convenience; failing to take one must never block
-      // the conversation. Recorded so a silently-empty stack is explicable.
-      logTurnEvent({ ev: "error", where: "undo_snapshot", message: (e as Error).message });
-    }
+  // Undo point taken before anything runs — including approval follow-ups,
+  // which is when the mutation actually lands. The turn discards this
+  // snapshot unless a successful mutation is recorded, so read-only
+  // questions (and rejected / unexecuted proposals) do not consume a slot
+  // or rewind later manual edits.
+  let undoSnapshotId: string | null = null;
+  try {
+    const snap = snapshotForUndo(typeof body.message === "string" ? body.message : "");
+    undoSnapshotId = snap?.id ?? null;
+  } catch (e) {
+    // An undo point is a convenience; failing to take one must never block
+    // the conversation. Recorded so a silently-empty stack is explicable.
+    logTurnEvent({ ev: "error", where: "undo_snapshot", message: (e as Error).message });
   }
 
   // Pre-bake a snapshot of the active workspace (same takeHome + frequency
@@ -1929,6 +1934,13 @@ async function prepareTurn(
         console.error(
           `[chat] compaction failed estimated=${estimated}tok duration=${Date.now() - t0}ms err=${(e as Error).message}`,
         );
+        if (undoSnapshotId) {
+          try {
+            discardUndoSnapshot(undoSnapshotId);
+          } catch {
+            /* convenience path — never block the error response */
+          }
+        }
         return {
           error: {
             status: 502,
@@ -1986,6 +1998,7 @@ async function prepareTurn(
       priorSummary,
       customPageStatus,
       customPageAuthoring,
+      undoSnapshotId,
     },
   };
 }
@@ -2092,6 +2105,33 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
         });
         logTurnEvent({ ev: "error", where: "repeat_loop", name: toolName, message: "warn" });
       }
+    }
+  }
+
+  /** True when this request actually changed budget (or custom-page) data.
+   *  Approved-action replays and failed calls do not count; read-only tools
+   *  never do. Auto-apply writes (set_custom_page) run in this same request. */
+  function turnRecordedMutation(
+    approvedExecuted: boolean,
+    records: Array<{ name: string; error?: string }>,
+  ): boolean {
+    if (approvedExecuted) return true;
+    return records.some((r) => !r.error && AUTO_APPLY_TOOLS.has(r.name));
+  }
+
+  /** Keep the pre-turn snapshot only when a mutation landed; otherwise drop
+   *  it so read-only questions do not fill the undo stack. */
+  function finalizeChatUndoSnapshot(
+    snapshotId: string | null,
+    approvedExecuted: boolean,
+    records: Array<{ name: string; error?: string }>,
+  ): void {
+    if (!snapshotId) return;
+    if (turnRecordedMutation(approvedExecuted, records)) return;
+    try {
+      discardUndoSnapshot(snapshotId);
+    } catch (e) {
+      logTurnEvent({ ev: "error", where: "undo_discard", message: (e as Error).message });
     }
   }
 
@@ -2255,7 +2295,7 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
     if ("error" in prep) {
       return c.json(prep.error.body, prep.error.status);
     }
-    const { ctx, history, compactionResult, workspaceId } = prep.prepared;
+    const { ctx, history, compactionResult, workspaceId, undoSnapshotId } = prep.prepared;
 
     const toolCallRecords: Array<{
       name: string;
@@ -2312,6 +2352,11 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
           );
         });
         if (!retried.ok) {
+          finalizeChatUndoSnapshot(
+            undoSnapshotId,
+            approvedRun.executed,
+            toolCallRecords,
+          );
           return c.json(
             {
               ok: false,
@@ -2329,6 +2374,11 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
 
       const choice = res.choices[0];
       if (!choice) {
+        finalizeChatUndoSnapshot(
+          undoSnapshotId,
+          approvedRun.executed,
+          toolCallRecords,
+        );
         return c.json({ ok: false, error: "no_choice", message: "LLM returned no choices" }, 502);
       }
       const msg = choice.message;
@@ -2419,6 +2469,11 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
     }
 
     const affectedResources = affectedResourcesOf(toolCallRecords);
+    finalizeChatUndoSnapshot(
+      undoSnapshotId,
+      approvedRun.executed,
+      toolCallRecords,
+    );
 
     return c.json({
       ok: true,
@@ -2507,7 +2562,7 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
           controller.close();
           return;
         }
-        const { ctx, history, compactionResult, workspaceId } = prep.prepared;
+        const { ctx, history, compactionResult, workspaceId, undoSnapshotId } = prep.prepared;
 
         const toolCallRecords: Array<{
           name: string;
@@ -2833,6 +2888,11 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
           // — so close quietly without an `error` event (which would otherwise
           // pop an error toast). Real LLM/network failures still surface.
           if (reqSignal.aborted || (e as Error)?.name === "AbortError") {
+            finalizeChatUndoSnapshot(
+              undoSnapshotId,
+              approvedRun.executed,
+              toolCallRecords,
+            );
             try {
               controller.close();
             } catch {
@@ -2841,6 +2901,11 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
             return;
           }
           logTurnEvent({ ev: "error", where: "stream", message: (e as Error).message });
+          finalizeChatUndoSnapshot(
+            undoSnapshotId,
+            approvedRun.executed,
+            toolCallRecords,
+          );
           send("error", {
             ok: false,
             error: "llm_unreachable",
@@ -2859,6 +2924,11 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
         // Client disconnected (Stop) before we reached a final answer — don't
         // try to write `done` to a dead connection.
         if (reqSignal.aborted) {
+          finalizeChatUndoSnapshot(
+            undoSnapshotId,
+            approvedRun.executed,
+            toolCallRecords,
+          );
           try {
             controller.close();
           } catch {
@@ -2868,6 +2938,11 @@ export function chatRouter(opts: ChatRouterOptions = {}): Hono {
         }
 
         const affectedResources = affectedResourcesOf(toolCallRecords);
+        finalizeChatUndoSnapshot(
+          undoSnapshotId,
+          approvedRun.executed,
+          toolCallRecords,
+        );
         logTurnEvent({
           ev: "finish",
           turns: history.filter((m) => m.role === "assistant").length,
