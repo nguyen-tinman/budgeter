@@ -31,6 +31,7 @@ import {
   hasVulkanBackend,
   MODEL_REGISTRY,
   modelById,
+  resetGpuCache,
 } from "./llama_launcher.js";
 
 /** Default model id — the bundled Qwen3.5-2B-MTP. The URL + on-disk path are
@@ -96,6 +97,10 @@ async function runPipeline(opts: OrchestrateOptions): Promise<void> {
     beginStep1("Already installed (Vulkan)");
     updateStep1({ bytesDone: 1, bytesTotal: 1, percent: 100 });
     finishStep1(`Found existing Vulkan-capable binary at ${existingBin}`);
+    // A /models probe may have run before this binary existed (or before a
+    // Vulkan build replaced a CPU-only one). Forget that reading so the next
+    // recommendation / launchProfile() call re-probes.
+    resetGpuCache();
   } else {
     if (existingBin) {
       beginStep1("Replacing CPU-only binary with Vulkan build…");
@@ -125,6 +130,7 @@ async function runPipeline(opts: OrchestrateOptions): Promise<void> {
         },
       });
       finishStep1("Installed");
+      resetGpuCache();
     } catch (err) {
       failStep1(err instanceof Error ? err.message : String(err));
       return;

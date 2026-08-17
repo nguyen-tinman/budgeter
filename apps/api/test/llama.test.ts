@@ -4,6 +4,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { Hono } from "hono";
 import { EventEmitter } from "node:events";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildArgs,
   defaultProfile,
@@ -17,6 +20,8 @@ import {
   MODEL_REGISTRY,
   parseDeviceList,
   chooseSetupModel,
+  detectGpu,
+  resetGpuCache,
   GPU_VRAM_MIB_FOR_LARGE_MODEL,
   type ModelSpec,
   type GpuInfo,
@@ -429,6 +434,38 @@ describe("/api/llama REST routes", () => {
     const body = (await res.json()) as { ok: boolean; tag: string };
     expect(body.ok).toBe(true);
     expect(body.tag).toBe("b9999");
+  });
+
+  it("POST /update re-probes the GPU after a real install", async () => {
+    resetGpuCache();
+    const dir = mkdtempSync(join(tmpdir(), "budgetkit-gpu-update-"));
+    try {
+      expect(detectGpu(join(dir, "missing-llama-server"))).toBeNull();
+      const { llamaRouter } = await import("../src/routes/llama.js");
+      const launcher = new LlamaLauncher({ binPath: "/does/not/exist" });
+      const update = async () => ({
+        tag: "b9999",
+        assetName: "stub.zip",
+        assetUrl: "https://example/stub.zip",
+        destPath: "/tmp/stub.zip",
+        bytesDownloaded: 1,
+        swapped: true,
+        extracted: true,
+        dryRun: false,
+      });
+      const app = new Hono();
+      app.route("/api/llama", llamaRouter({ launcher, update }));
+      const res = await app.request("/api/llama/update", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(200);
+      expect(detectGpu(writeFakeLlamaServer(dir))?.name).toBe("Fake GPU");
+    } finally {
+      resetGpuCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("autoStartLlama is a no-op (external) when LLAMA_SERVER_URL is set", async () => {
@@ -1118,4 +1155,97 @@ describe("llama_launcher — GPU detection + setup default", () => {
     expect(new Set(names).size).toBe(names.length);
     expect(large.fileName).toContain("MTP");
   });
+
+  it("does not cache a missing-binary probe, so a later install is visible", () => {
+    resetGpuCache();
+    const dir = mkdtempSync(join(tmpdir(), "budgetkit-gpu-probe-"));
+    try {
+      expect(detectGpu("")).toBeNull();
+      // If the missing-binary result had been memoized, this would stay null
+      // even though a probing binary is now on disk.
+      expect(detectGpu(writeFakeLlamaServer(dir))).toEqual({
+        name: "Fake GPU",
+        totalMiB: 8192,
+        freeMiB: 7000,
+      });
+    } finally {
+      resetGpuCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resetGpuCache forgets a failed probe so a replaced binary is re-read", () => {
+    resetGpuCache();
+    const dir = mkdtempSync(join(tmpdir(), "budgetkit-gpu-reset-"));
+    try {
+      expect(detectGpu(join(dir, "missing-llama-server"))).toBeNull();
+      const bin = writeFakeLlamaServer(dir);
+      // Cached null from the failed probe would hide the new binary.
+      expect(detectGpu(bin)).toBeNull();
+      resetGpuCache();
+      expect(detectGpu(bin)?.name).toBe("Fake GPU");
+    } finally {
+      resetGpuCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
+
+describe("setup orchestrator — GPU cache after install", () => {
+  it("resets a stale missing-binary probe after the updater installs llama-server", async () => {
+    const { reset } = await import("../src/services/setup_progress.js");
+    const { startSetup, getSetupStatus } = await import("../src/services/setup_orchestrator.js");
+    reset();
+    resetGpuCache();
+    const dir = mkdtempSync(join(tmpdir(), "budgetkit-gpu-setup-"));
+    try {
+      expect(detectGpu(join(dir, "missing-llama-server"))).toBeNull();
+      const started = startSetup({
+        llamaUpdater: async () => ({
+          tag: "b1",
+          assetName: "stub.zip",
+          assetUrl: "https://example/stub.zip",
+          destPath: join(dir, "stub.zip"),
+          bytesDownloaded: 1,
+          swapped: true,
+          extracted: true,
+          dryRun: false,
+        }),
+        downloader: async () => {
+          /* GGUF body unused — we only care that step 1 reset the GPU cache */
+        },
+        modelRelPath: join(dir, "missing.gguf"),
+        binDirRelPath: dir,
+      });
+      expect(started.ok).toBe(true);
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        const state = getSetupStatus();
+        if (state.overall === "done" || state.overall === "error") break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(getSetupStatus().overall).toBe("done");
+      expect(detectGpu(writeFakeLlamaServer(dir))?.name).toBe("Fake GPU");
+    } finally {
+      reset();
+      resetGpuCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/** A tiny stand-in for `llama-server --list-devices`. */
+function writeFakeLlamaServer(dir: string): string {
+  if (process.platform === "win32") {
+    const p = join(dir, "llama-server.cmd");
+    writeFileSync(p, "@echo   Vulkan0: Fake GPU (8192 MiB, 7000 MiB free)\r\n");
+    return p;
+  }
+  const p = join(dir, "llama-server");
+  writeFileSync(
+    p,
+    "#!/bin/sh\necho '  Vulkan0: Fake GPU (8192 MiB, 7000 MiB free)'\n",
+  );
+  chmodSync(p, 0o755);
+  return p;
+}
