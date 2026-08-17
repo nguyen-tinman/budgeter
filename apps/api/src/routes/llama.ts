@@ -19,6 +19,7 @@ import {
   launchProfile,
   modelById,
   MODEL_REGISTRY,
+  resetGpuCache,
   type LlamaProfile,
 } from "../services/llama_launcher.js";
 import { defaultLlamaUrl } from "../services/llama_client.js";
@@ -219,6 +220,10 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
     if (typeof r0.preferVulkan === "boolean") safe.preferVulkan = r0.preferVulkan;
     try {
       const r = await updater(safe);
+      // A successful install/replace can change what --list-devices reports
+      // (missing binary → Vulkan build, or CPU-only → Vulkan). Drop the
+      // memoized probe so /models and launchProfile() see the new binary.
+      if (!r.dryRun) resetGpuCache();
       return c.json({ ok: true, ...r });
     } catch (e) {
       return c.json({ ok: false, error: (e as Error).message }, 502);

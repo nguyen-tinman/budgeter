@@ -118,6 +118,22 @@ export function snapshotForUndo(label: string): UndoSnapshot | null {
   return { id: entry.id, takenAt: entry.takenAt, label: entry.label, sizeBytes: entry.sizeBytes };
 }
 
+/**
+ * Drop a snapshot without restoring it. Chat uses this when a turn took an
+ * undo point up front and then recorded no successful mutation — keeping
+ * those would fill the ten-step stack with questions that changed no budget
+ * data, and walking them would rewind unrelated manual edits.
+ */
+export function discardUndoSnapshot(id: string): boolean {
+  const entries = readManifest();
+  const idx = entries.findIndex((e) => e.id === id);
+  if (idx < 0) return false;
+  const [removed] = entries.splice(idx, 1);
+  writeManifest(entries);
+  if (removed) rmSync(removed.file, { force: true });
+  return true;
+}
+
 /** Newest first — the order the UI walks when undoing repeatedly. */
 export function listUndoSnapshots(): UndoSnapshot[] {
   return readManifest()
@@ -175,6 +191,22 @@ function tableNames(db: DatabaseSync, schema: string): string[] {
     .map((r: { name: string }) => r.name);
 }
 
+/** Tables that record which migrations have been applied. Restoring these
+ *  from an older snapshot would make `migrate()` treat newer, already-applied
+ *  migrations as pending and re-run non-idempotent DDL. */
+const MIGRATION_META_TABLES = new Set(["schema_migrations"]);
+
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+function tableColumns(db: DatabaseSync, schema: string, table: string): string[] {
+  return db
+    .prepare(`PRAGMA ${schema}.table_info(${quoteIdent(table)})`)
+    .all()
+    .map((r: { name: string }) => r.name);
+}
+
 function applySnapshot(db: DatabaseSync, file: string): void {
   db.exec(`ATTACH DATABASE ${sqlLiteral(file)} AS undo_src`);
   try {
@@ -186,12 +218,23 @@ function applySnapshot(db: DatabaseSync, file: string): void {
     try {
       const source = new Set(tableNames(db, "undo_src"));
       // Tables the snapshot doesn't know about (added by a migration since)
-      // are emptied rather than left with rows from the future.
+      // are emptied rather than left with rows from the future. Migration
+      // metadata is left alone so the live schema version stays authoritative.
       for (const table of tableNames(db, "main")) {
-        db.exec(`DELETE FROM main."${table}"`);
-        if (source.has(table)) {
-          db.exec(`INSERT INTO main."${table}" SELECT * FROM undo_src."${table}"`);
-        }
+        if (MIGRATION_META_TABLES.has(table)) continue;
+        db.exec(`DELETE FROM main.${quoteIdent(table)}`);
+        if (!source.has(table)) continue;
+        // Copy only columns that exist on both sides. A wholesale SELECT *
+        // breaks when a later migration added or removed a column; shared
+        // names still restore the snapshot's budget data, and new columns
+        // keep their DEFAULT / NULL.
+        const destCols = new Set(tableColumns(db, "main", table));
+        const shared = tableColumns(db, "undo_src", table).filter((c) => destCols.has(c));
+        if (shared.length === 0) continue;
+        const cols = shared.map(quoteIdent).join(", ");
+        db.exec(
+          `INSERT INTO main.${quoteIdent(table)} (${cols}) SELECT ${cols} FROM undo_src.${quoteIdent(table)}`,
+        );
       }
       db.exec("COMMIT");
     } catch (e) {

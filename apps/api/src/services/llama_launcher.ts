@@ -239,12 +239,19 @@ let gpuCache: GpuInfo | null | undefined;
  * what we probe and what actually loads.
  *
  * Returns the largest device by free VRAM, or null when there is no GPU, the
- * binary is missing, or the probe fails for any reason. Cached for the process
- * lifetime: it costs a subprocess and the answer does not change usefully.
+ * binary is missing, or the probe fails for any reason.
+ *
+ * A successful or failed probe of an installed binary is cached for the
+ * process lifetime: it costs a subprocess and the answer does not change
+ * usefully. A missing binary is NOT cached — `/api/llama/models` runs this
+ * before first-run setup has unpacked llama-server, and treating that as a
+ * permanent "no GPU" would keep recommending the CPU model and disable MTP
+ * after the binary lands. Call `resetGpuCache()` after the updater installs
+ * or replaces the binary so a prior failed probe is also forgotten.
  */
 export function detectGpu(binPath = findInstalledLlamaServer()): GpuInfo | null {
   if (gpuCache !== undefined) return gpuCache;
-  if (!binPath) return (gpuCache = null);
+  if (!binPath) return null;
   try {
     const res = spawnSync(binPath, ["--list-devices"], {
       encoding: "utf8",

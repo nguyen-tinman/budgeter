@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Hono } from "hono";
 import type {
   ChatRequest,
@@ -64,6 +64,7 @@ beforeEach(async () => {
   const cfg = defaultDbConfig();
   rmSync(cfg.path, { force: true });
   for (const side of ["-wal", "-shm"]) rmSync(`${cfg.path}${side}`, { force: true });
+  rmSync(resolve(dirname(cfg.path), "undo"), { recursive: true, force: true });
   // The approved-action replay guard is module state that outlives the DB
   // reset; clear it so cases can't leak keys into one another.
   resetApprovedActionReplayGuard();
@@ -1966,5 +1967,148 @@ describe("compactInFlight", () => {
     await compactInFlight(prepared, summarizer);
     // Settled turns folded, tool result already tiny.
     expect(await compactInFlight(prepared, summarizer)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Undo snapshots are retained only when a turn actually mutates data.
+// A read-only question used to leave a snapshot (and ChatPanel's chat_log
+// write made the next question's hash differ), filling the ten-step stack
+// with turns that rewind unrelated manual edits.
+// ---------------------------------------------------------------------------
+
+describe("undo — chat turns keep snapshots only for successful mutations", () => {
+  it("discards the snapshot after a read-only question", async () => {
+    const app = await freshApp(stubClient([asstText("Hello!")]));
+    const res = await app.request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "what's my budget look like" }),
+    });
+    expect(res.status).toBe(200);
+    const { listUndoSnapshots } = await import("@budgetkit/db");
+    expect(listUndoSnapshots()).toEqual([]);
+  });
+
+  it("discards after a read-only tool call, even when chat_log then changes", async () => {
+    const app = await freshApp(
+      stubClient([
+        asstToolCall("list_workspaces", {}),
+        asstText("You have 1 workspace."),
+        asstText("Still just Current."),
+      ]),
+    );
+    const first = await app.request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "what workspaces do I have" }),
+    });
+    expect(first.status).toBe(200);
+
+    // ChatPanel persists the transcript after every turn, which changes the
+    // database hash. Hash-dedup therefore cannot collapse a second read-only
+    // question into the first snapshot.
+    await app.request("/api/chat/log", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [
+          { role: "user", text: "what workspaces do I have" },
+          { role: "assistant", text: "You have 1 workspace." },
+        ],
+      }),
+    });
+
+    const second = await app.request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "and what is the name of the first one" }),
+    });
+    expect(second.status).toBe(200);
+
+    const { listUndoSnapshots } = await import("@budgetkit/db");
+    expect(listUndoSnapshots()).toEqual([]);
+  });
+
+  it("does not keep a snapshot for a pending (unexecuted) mutation", async () => {
+    const app = await freshApp(
+      stubClient([
+        asstToolCall("add_expense", {
+          workspaceId: 1,
+          label: "ShouldNotSnapshot",
+          amountDollars: 10,
+          frequency: "monthly",
+        }),
+      ]),
+    );
+    const res = await app.request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "add a $10 expense" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { pendingActions?: unknown[] };
+    expect(body.pendingActions).toHaveLength(1);
+    const { listUndoSnapshots } = await import("@budgetkit/db");
+    expect(listUndoSnapshots()).toEqual([]);
+  });
+
+  it("keeps a snapshot when an approved mutation lands, and undo reverts it", async () => {
+    const app = await freshApp(stubClient([asstText("Added TestUndoRent.")]));
+    const res = await app.request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        message: "approve",
+        approvedActions: [
+          {
+            toolName: "add_expense",
+            args: { workspaceId: 1, label: "TestUndoRent", amountDollars: 900, frequency: "monthly" },
+          },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const { openDb, listUndoSnapshots, undoLastUserTurn } = await import("@budgetkit/db");
+    expect(listUndoSnapshots()).toHaveLength(1);
+    const db = openDb();
+    expect(
+      db.prepare("SELECT label FROM expenses WHERE label = ?").get("TestUndoRent"),
+    ).toBeDefined();
+
+    const undone = undoLastUserTurn();
+    expect(undone.restored).toBe(true);
+    expect(
+      db.prepare("SELECT label FROM expenses WHERE label = ?").get("TestUndoRent"),
+    ).toBeUndefined();
+  });
+
+  it("keeps a snapshot for an auto-applied set_custom_page write", async () => {
+    const pageArgs = {
+      action: "set",
+      title: "Undo me",
+      queries: [{ id: "food", tool: "query_transactions", args: { groupBy: "week" } }],
+      render: 'bk.note(root, "hi");',
+    };
+    const app = await freshApp(
+      stubClient([asstToolCall("set_custom_page", pageArgs), asstText("Built.")]),
+    );
+    const res = await app.request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "build a page" }),
+    });
+    expect(res.status).toBe(200);
+    const { listUndoSnapshots } = await import("@budgetkit/db");
+    expect(listUndoSnapshots()).toHaveLength(1);
+  });
+
+  it("discards the snapshot after a read-only stream turn", async () => {
+    const app = await freshApp(streamClient([[deltaChunk("Just looking.", "stop")]]));
+    const events = await collectStream(app, { message: "how am I doing" });
+    expect(events.some((e) => e.event === "done")).toBe(true);
+    const { listUndoSnapshots } = await import("@budgetkit/db");
+    expect(listUndoSnapshots()).toEqual([]);
   });
 });
