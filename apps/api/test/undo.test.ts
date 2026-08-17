@@ -136,6 +136,77 @@ describe("undo — snapshots keyed to user turns", () => {
     expect(r.restored).toBe(false);
     expect(r.remaining).toBe(0);
   });
+
+  it("discardUndoSnapshot drops the file without restoring data", async () => {
+    const db = await freshDb();
+    const { snapshotForUndo, discardUndoSnapshot, listUndoSnapshots } = await import("@budgetkit/db");
+
+    const snap = snapshotForUndo("read-only question");
+    expect(snap).not.toBeNull();
+    db.exec("INSERT INTO workspaces (name, kind) VALUES ('still-here', 'scenario')");
+
+    expect(discardUndoSnapshot(snap!.id)).toBe(true);
+    expect(listUndoSnapshots()).toEqual([]);
+    expect(workspaceNames(db)).toContain("still-here");
+    expect(discardUndoSnapshot(snap!.id)).toBe(false);
+  });
+
+  it("does not restore schema_migrations from an older snapshot", async () => {
+    const db = await freshDb();
+    const { snapshotForUndo, undoLastUserTurn } = await import("@budgetkit/db");
+
+    snapshotForUndo("before upgrade");
+    db.exec("INSERT INTO workspaces (name, kind) VALUES ('temp-upgrade', 'scenario')");
+    // Simulate a later migration that the snapshot predates: a new table plus
+    // its schema_migrations row. Restoring those rows would make migrate()
+    // treat the new migration as unapplied and re-run its DDL.
+    db.exec("CREATE TABLE post_upgrade (id INTEGER PRIMARY KEY, note TEXT)");
+    db.exec("INSERT INTO post_upgrade (note) VALUES ('live-only')");
+    db.exec("INSERT INTO schema_migrations (id) VALUES ('999_future')");
+
+    const migrationsBefore = db
+      .prepare("SELECT id FROM schema_migrations ORDER BY id")
+      .all()
+      .map((r: { id: string }) => r.id);
+    expect(migrationsBefore).toContain("999_future");
+
+    const result = undoLastUserTurn();
+    expect(result.restored).toBe(true);
+    expect(workspaceNames(db)).not.toContain("temp-upgrade");
+
+    const migrationsAfter = db
+      .prepare("SELECT id FROM schema_migrations ORDER BY id")
+      .all()
+      .map((r: { id: string }) => r.id);
+    expect(migrationsAfter).toEqual(migrationsBefore);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM post_upgrade").get() as { n: number }).toEqual({
+      n: 0,
+    });
+  });
+
+  it("restores rows when the live table has gained a column since the snapshot", async () => {
+    const db = await freshDb();
+    const { snapshotForUndo, undoLastUserTurn } = await import("@budgetkit/db");
+
+    snapshotForUndo("before column add");
+    db.exec("INSERT INTO workspaces (name, kind) VALUES ('gone-after-col', 'scenario')");
+    // SELECT * copy fails here: undo_src.workspaces has fewer columns than
+    // main. Named intersection must still restore the snapshot's rows.
+    db.exec("ALTER TABLE workspaces ADD COLUMN extra_note TEXT NOT NULL DEFAULT 'live'");
+
+    const result = undoLastUserTurn();
+    expect(result.restored).toBe(true);
+    expect(workspaceNames(db)).not.toContain("gone-after-col");
+
+    const cols = (
+      db.prepare("PRAGMA table_info(workspaces)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    expect(cols).toContain("extra_note");
+    const current = db
+      .prepare("SELECT extra_note FROM workspaces WHERE name = 'Current'")
+      .get() as { extra_note: string };
+    expect(current.extra_note).toBe("live");
+  });
 });
 
 describe("undo — REST surface", () => {
