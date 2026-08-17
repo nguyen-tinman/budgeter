@@ -126,8 +126,15 @@ export interface BackfillResult {
  * backfilling. Returns how many one-time rows were scanned vs. matched, plus
  * the details of each changed row ({ id, label?, spendDate }) so the caller can
  * record an audit trail of what this pass wrote.
+ *
+ * With `{ dryRun: true }` the matching runs identically but no row is written —
+ * `changed` then lists what WOULD be written, which is what the
+ * backfill_spend_dates tool previews before asking for confirmation.
  */
-export function backfillOneTimeSpendDates(ctx: SpendDateBackfillCtx): BackfillResult {
+export function backfillOneTimeSpendDates(
+  ctx: SpendDateBackfillCtx,
+  opts: { dryRun?: boolean } = {},
+): BackfillResult {
   const pending: OneTimeExpenseLite[] = [];
   for (const ws of ctx.workspaces.list()) {
     for (const e of ctx.expenses.list(ws.id)) {
@@ -142,7 +149,7 @@ export function backfillOneTimeSpendDates(ctx: SpendDateBackfillCtx): BackfillRe
   const resolved = resolveOneTimeSpendDates(pending, ctx.transactions.listChargeRows());
   const changed: BackfillChange[] = [];
   for (const r of resolved) {
-    ctx.expenses.update({ id: r.id, spendDate: r.spendDate });
+    if (!opts.dryRun) ctx.expenses.update({ id: r.id, spendDate: r.spendDate });
     changed.push({ id: r.id, label: labelById.get(r.id), spendDate: r.spendDate });
   }
   return { scanned: pending.length, matched: resolved.length, changed };

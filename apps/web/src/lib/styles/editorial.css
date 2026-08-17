@@ -97,6 +97,10 @@
   grid-template-rows: auto 1fr;
   height: 100%;
   min-height: 100%;
+  /* Below this the fixed-layout desktop shell cannot fit; widen the document
+   * so the window scrolls horizontally instead of silently clipping the nav
+   * and the assistant panel (overflow:hidden on .bk-body eats them). */
+  min-width: 1024px;
 }
 .bk-shell[data-chat="true"]  .bk-body { grid-template-columns: 1fr 340px; }
 .bk-shell[data-chat="false"] .bk-body { grid-template-columns: 1fr; }
@@ -117,7 +121,10 @@
 .bk-nav {
   display: flex;
   align-items: center;
-  gap: 22px;
+  /* Wrap onto a second row rather than overflow when the window is narrow —
+   * the tab row's min-content width is ~1100px and flex won't shrink it. */
+  flex-wrap: wrap;
+  gap: 8px 22px;
   padding: 14px 28px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -169,6 +176,19 @@
   color: var(--text-3);
   font-size: 12px;
 }
+
+/* Onboarding badge — a small accent dot on the Setup tab / assistant toggle
+ * while the local LLM has never been downloaded. `data-float` pins it to the
+ * corner of an icon button instead of sitting inline after a label. */
+.bk-nav-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+  align-self: center;
+}
+.bk-nav-dot[data-float="true"] { position: absolute; top: 3px; right: 3px; }
 
 .bk-nav-actions { margin-left: auto; display: flex; gap: 10px; align-items: center; }
 .bk-nav-sep { width: 1px; height: 18px; background: var(--border); }
@@ -350,6 +370,9 @@
  * (eff.)" don't bloat the column past what the values need. */
 .bk-table-savings {
   table-layout: fixed;
+  /* Below this the fixed columns cannot hold their headers/controls; the
+   * overflow-x wrapper around the table scrolls instead. */
+  min-width: 780px;
 }
 .bk-table-savings thead th {
   white-space: normal;
@@ -371,9 +394,11 @@
 .bk-table-savings col.col-balance   { width: 11%; }
 .bk-table-savings col.col-emp       { width: 11%; }
 .bk-table-savings col.col-pct       { width: 8%;  }
-.bk-table-savings col.col-match     { width: 18%; }
+.bk-table-savings col.col-match     { width: 16%; }
 .bk-table-savings col.col-monthly   { width: 10%; }
-.bk-table-savings col.col-annual    { width: 10%; }
+/* Fixed px, not % — "Annualized[8]" must fit on one line or the [8] footnote
+ * ref orphans onto a second header row; the % columns absorb the slack. */
+.bk-table-savings col.col-annual    { width: 112px; }
 .bk-table-savings col.col-del       { width: 4%;  }
 /* This table uses table-layout: fixed with narrow columns. Bare .bk-input /
  * .bk-select render at their intrinsic width, overflow the fixed columns, and
@@ -386,8 +411,11 @@
 .bk-table-savings tfoot td > .bk-input,
 .bk-table-savings tfoot td > .bk-select { width: 100%; }
 /* Footnote-ref inline with the value: prevent the [N] superscript from
- * dropping onto a second line when the cell is tight. */
-.bk-table-savings .bk-cell-num { white-space: nowrap; }
+ * dropping onto a second line when the cell is tight. Body/foot cells only —
+ * on thead th it would override the white-space:normal above and force
+ * headings like "Monthly add (eff.)" to overflow into the neighbor column. */
+.bk-table-savings tbody .bk-cell-num,
+.bk-table-savings tfoot .bk-cell-num { white-space: nowrap; }
 
 /* Error banner — used for action/refresh failures that the user MUST see.
  * The previous inline `color: var(--negative)` text was easy to miss; this
@@ -635,12 +663,47 @@
   padding: 8px 12px;
   border-radius: var(--radius-sm);
   font-size: 13px; max-width: 92%;
-  white-space: pre-wrap;
   line-height: 1.45;
 }
+/* pre-wrap belongs to the TEXT, not to the bubble.
+ *
+ * Svelte emits a literal space between adjacent {#if} blocks — the compiled
+ * bubble is `<div class="bk-msg"><!> <!></div>`. With pre-wrap on the bubble
+ * that space is preserved rather than collapsed, so every message painted a
+ * ~19px empty line box: a phantom blank line above each tool chip, and a
+ * fully-bordered empty box for a message that had neither text nor chips.
+ * Scoping pre-wrap to the text span lets the container collapse its own
+ * whitespace normally while assistant replies keep their line breaks. */
+.bk-msg-text { white-space: pre-wrap; }
 .bk-msg[data-role="user"]      { background: var(--accent-soft); color: var(--text); align-self: flex-end; }
 .bk-msg[data-role="assistant"] { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
 .bk-msg[data-role="system"]    { background: transparent; color: var(--text-3); font-style: italic; font-size: 12px; padding: 2px 4px; }
+/* A completed step of a multi-step task, not the answer: recessed so the run
+ * reads as progress leading to the final bubble rather than several replies. */
+.bk-msg[data-role="assistant"][data-step="true"] {
+  background: transparent;
+  border-style: dashed;
+  color: var(--text-2);
+}
+/* A step that only ran tools — the chip IS the whole message, so drop the
+ * bubble around it. Full padding + border on a one-line chip wastes vertical
+ * space, and a run of them (compute_retirement twice, say) pushes the answer
+ * off screen. Kept as a flush chip that still reads as its own step.
+ *
+ * Must match the [data-step] rule's specificity (class + two attributes) and
+ * follow it, or that rule's border-style:dashed wins and — since `border:none`
+ * resets the width to `medium` — paints a 3px dashed frame instead of none. */
+.bk-msg[data-role="assistant"][data-actions-only="true"] {
+  padding: 0;
+  background: transparent;
+  border: 0 none;
+  max-width: 100%;
+}
+.bk-msg[data-role="assistant"][data-actions-only="true"] .bk-msg-tool { margin-top: 0; }
+/* Consecutive action-only steps sit tighter than the log's normal gap. */
+.bk-msg[data-actions-only="true"] + .bk-msg[data-actions-only="true"] {
+  margin-top: -4px;
+}
 .bk-msg-tool {
   margin-top: 4px;
   font-family: var(--font-num);

@@ -709,3 +709,243 @@ describe("C1 — mutation gate on POST /api/tools/:name", () => {
     expect(argsRow.args_json).not.toContain("BlockedAudit");
   });
 });
+
+// ---------------------------------------------------------------------------
+// query_transactions — real SQLite aggregation — and the /custom page document
+// over REST, where the mutation gate still applies (chat auto-applies it, this
+// transport does not).
+// ---------------------------------------------------------------------------
+
+describe("query_transactions — grouped aggregation over seeded SQL", () => {
+  async function freshCtx() {
+    const { openDb, migrate, buildToolCtx } = await import("@budgetkit/db");
+    const db = openDb();
+    migrate(db);
+    return buildToolCtx(db, "api_direct");
+  }
+
+  /** Seed one import's worth of rows. 2026-08-04 and 2026-08-11 are Tuesdays
+   *  (dayOfWeek 2); their Sunday-start week keys are 2026-08-02 and
+   *  2026-08-09. 2026-08-05 is a Wednesday in the SAME week as the first
+   *  Tuesday, so a leaking weekday filter shows up in the sums. */
+  function seed(ctx: Awaited<ReturnType<typeof freshCtx>>, catId: number): void {
+    const rec = ctx.statementImports.record({
+      sourceAccount: "chase",
+      fileHash: `hash-${Math.random()}`,
+      filePath: "statements/seed.csv",
+      txnCount: 6,
+    });
+    ctx.transactions.insertMany(rec.importId, [
+      { postedDate: "2026-08-04", merchantRaw: "WHOLE FOODS", merchantNormalized: "whole foods", amountDollars: -40, categoryId: catId, accountType: "chase" },
+      { postedDate: "2026-08-04", merchantRaw: "TRADER JOES", merchantNormalized: "trader joes", amountDollars: -25, categoryId: catId, accountType: "chase" },
+      { postedDate: "2026-08-11", merchantRaw: "WHOLE FOODS", merchantNormalized: "whole foods", amountDollars: -30, categoryId: catId, accountType: "chase" },
+      // Wednesday, same week as 2026-08-04 — excluded by dayOfWeek:2.
+      { postedDate: "2026-08-05", merchantRaw: "WHOLE FOODS", merchantNormalized: "whole foods", amountDollars: -100, categoryId: catId, accountType: "chase" },
+      // A Tuesday CREDIT — excluded unless includeCredits.
+      { postedDate: "2026-08-11", merchantRaw: "WHOLE FOODS", merchantNormalized: "whole foods", amountDollars: 10, categoryId: catId, accountType: "chase" },
+      // Uncategorized Tuesday charge — lands in its own 'uncat' bucket.
+      { postedDate: "2026-08-04", merchantRaw: "CORNER STORE", merchantNormalized: "corner store", amountDollars: -5, categoryId: null, accountType: "chase" },
+    ]);
+  }
+
+  async function query(app: Hono, args: object) {
+    const res = await app.request("/api/tools/query_transactions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(args),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        groups: Array<{ key: string; value: number; count: number }>;
+        totalGroups: number;
+        truncated: boolean;
+      };
+    };
+    return body.result;
+  }
+
+  it("dayOfWeek:2 + groupBy:week returns only Tuesday charges, keyed by Sunday week-starts", async () => {
+    const ctx = await freshCtx();
+    const app = await freshApp();
+    const catId = ctx.categories.listByName().get("Food")!;
+    seed(ctx, catId);
+
+    const r = await query(app, { categoryId: catId, dayOfWeek: 2, groupBy: "week" });
+    // 2026-08-04 (40+25) in week 2026-08-02; 2026-08-11 (30) in week 2026-08-09.
+    // The Wednesday $100 and the Tuesday credit are both absent.
+    expect(r.groups).toEqual([
+      { key: "2026-08-02", value: 65, count: 2 },
+      { key: "2026-08-09", value: 30, count: 1 },
+    ]);
+    expect(r.totalGroups).toBe(2);
+    expect(r.truncated).toBe(false);
+  });
+
+  it("groupBy day / dayOfWeek key on the date and the weekday number", async () => {
+    const ctx = await freshCtx();
+    const app = await freshApp();
+    const catId = ctx.categories.listByName().get("Food")!;
+    seed(ctx, catId);
+
+    const byDay = await query(app, { categoryId: catId, groupBy: "day" });
+    expect(byDay.groups.map((g) => g.key)).toEqual(["2026-08-04", "2026-08-05", "2026-08-11"]);
+    expect(byDay.groups[0]!.value).toBe(65);
+
+    const byDow = await query(app, { categoryId: catId, groupBy: "dayOfWeek" });
+    // '2' = Tuesday (65 + 30), '3' = Wednesday (100).
+    expect(byDow.groups).toEqual([
+      { key: "2", value: 95, count: 3 },
+      { key: "3", value: 100, count: 1 },
+    ]);
+  });
+
+  it("groupBy:category buckets NULL categories as 'uncat' and orders by spend DESC", async () => {
+    const ctx = await freshCtx();
+    const app = await freshApp();
+    const catId = ctx.categories.listByName().get("Food")!;
+    seed(ctx, catId);
+
+    const r = await query(app, { groupBy: "category" });
+    expect(r.groups[0]!.key).toBe(String(catId));
+    expect(r.groups[0]!.value).toBe(195); // 40+25+30+100
+    expect(r.groups[1]).toEqual({ key: "uncat", value: 5, count: 1 });
+  });
+
+  it("groupBy:merchant orders by spend DESC and truncates with totalGroups intact", async () => {
+    const ctx = await freshCtx();
+    const app = await freshApp();
+    const catId = ctx.categories.listByName().get("Food")!;
+    seed(ctx, catId);
+
+    const all = await query(app, { groupBy: "merchant" });
+    expect(all.groups.map((g) => g.key)).toEqual(["whole foods", "trader joes", "corner store"]);
+    expect(all.truncated).toBe(false);
+
+    const capped = await query(app, { groupBy: "merchant", limit: 1 });
+    expect(capped.groups).toHaveLength(1);
+    expect(capped.groups[0]!.key).toBe("whole foods");
+    expect(capped.totalGroups).toBe(3);
+    expect(capped.truncated).toBe(true);
+  });
+
+  it("metric count/avg select the other columns; includeCredits nets the refund out", async () => {
+    const ctx = await freshCtx();
+    const app = await freshApp();
+    const catId = ctx.categories.listByName().get("Food")!;
+    seed(ctx, catId);
+
+    const counted = await query(app, {
+      categoryId: catId, dayOfWeek: 2, groupBy: "week", metric: "count",
+    });
+    expect(counted.groups.map((g) => g.value)).toEqual([2, 1]);
+
+    const avg = await query(app, {
+      categoryId: catId, dayOfWeek: 2, groupBy: "week", metric: "avg",
+    });
+    expect(avg.groups[0]!.value).toBe(32.5); // (40+25)/2
+
+    // With credits the +10 refund on 2026-08-11 subtracts from that week.
+    const net = await query(app, {
+      categoryId: catId, dayOfWeek: 2, groupBy: "week", includeCredits: true,
+    });
+    expect(net.groups).toEqual([
+      { key: "2026-08-02", value: 65, count: 2 },
+      { key: "2026-08-09", value: 20, count: 2 },
+    ]);
+  });
+
+  it("returns an empty group list (not an error) when nothing matches", async () => {
+    const app = await freshApp();
+    const r = await query(app, { groupBy: "week", from: "2030-01-01" });
+    expect(r.groups).toEqual([]);
+    expect(r.totalGroups).toBe(0);
+    expect(r.truncated).toBe(false);
+  });
+
+  it("rejects a groupBy outside the enum before any SQL is built", async () => {
+    const app = await freshApp();
+    const res = await app.request("/api/tools/query_transactions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ groupBy: "posted_date); DROP TABLE transactions;--" }),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+});
+
+describe("custom page over REST — the mutation gate still applies", () => {
+  const definition = {
+    action: "set",
+    title: "Tuesday food",
+    queries: [{ id: "food", tool: "query_transactions", args: { groupBy: "week", dayOfWeek: 2 } }],
+    render: 'bk.note(root, "hi");',
+  };
+
+  async function getPage(app: Hono, args: object = {}) {
+    const res = await app.request("/api/tools/get_custom_page", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(args),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: {
+        exists: boolean;
+        updatedAt: string | null;
+        definition: { title: string } | null;
+        hasPrevious: boolean;
+        guide?: string;
+      };
+    };
+    return body.result;
+  }
+
+  it("set_custom_page without confirm → 409; with confirm:true → saved and persisted", async () => {
+    const app = await freshApp();
+    const refused = await app.request("/api/tools/set_custom_page", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(definition),
+    });
+    expect(refused.status).toBe(409);
+    expect((await getPage(app)).exists).toBe(false);
+
+    const ok = await app.request("/api/tools/set_custom_page", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...definition, confirm: true }),
+    });
+    expect(ok.status).toBe(200);
+
+    // Readable through a fresh router instance — the definition really is in
+    // the DB, which is what makes a Stop mid-turn safe (addendum A2): the
+    // write either committed or it didn't, never half.
+    const page = await getPage(await freshApp());
+    expect(page.exists).toBe(true);
+    expect(page.definition!.title).toBe("Tuesday food");
+    expect(page.updatedAt).toBeTruthy();
+  });
+
+  it("get_custom_page serves the authoring guide only on request", async () => {
+    const app = await freshApp();
+    expect((await getPage(app)).guide).toBeUndefined();
+    const withGuide = await getPage(app, { includeGuide: true });
+    expect(withGuide.guide).toMatch(/CUSTOM PAGE AUTHORING GUIDE/);
+  });
+
+  it("a query naming a non-allowlisted tool is rejected at write time", async () => {
+    const app = await freshApp();
+    const res = await app.request("/api/tools/set_custom_page", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...definition,
+        queries: [{ id: "boom", tool: "delete_expense", args: { id: 1 } }],
+        confirm: true,
+      }),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect((await getPage(app)).exists).toBe(false);
+  });
+});

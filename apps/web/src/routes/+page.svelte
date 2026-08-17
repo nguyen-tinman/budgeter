@@ -293,7 +293,7 @@
             (effective rate {(takeHome.effectiveTaxRate * 100).toFixed(1)}%<FootnoteRef topic="effective-rate" n={FN["effective-rate"]} onopen={openFootnote} />).
             That is {monthlyTakeHome > 0 ? ((monthlyRemaining / monthlyTakeHome) * 100).toFixed(0) : "—"}%<FootnoteRef topic="remaining-share" n={FN["remaining-share"]} onopen={openFootnote} /> of every dollar that lands in your account, free to direct as you wish.
           {:else}
-            <em>Set up your incomes</em> first — add a <strong>taxed W-2</strong> line in <a href="/budget" style="color: var(--accent)">Budget</a> to see take-home, tax burden, and the discretionary remainder<FootnoteRef topic="pretax" n={FN["pretax"]} onopen={openFootnote} />.
+            <em>Set up your incomes</em> first — add a <strong>taxed W‑2</strong> line in <a href="/budget" style="color: var(--accent)">Budget</a> to see take-home, tax burden, and the discretionary remainder<FootnoteRef topic="pretax" n={FN["pretax"]} onopen={openFootnote} />.
           {/if}
         </p>
       </div>
@@ -491,7 +491,7 @@
     <div class="ed-footnotes" data-testid="footnotes">
       <div><b>[{FN["monthly-remaining"]}] Monthly remaining.</b> Take-home minus recurring expenses (frequency-converted to monthly).</div>
       <div><b>[{FN["take-home"]}] Take-home.</b> What lands in your account after federal + CA + FICA + CA SDI + pretax buckets are removed.</div>
-      <div><b>[{FN["effective-rate"]}] Effective rate.</b> Federal + CA + FICA + CA SDI as a fraction of taxed W-2 gross.</div>
+      <div><b>[{FN["effective-rate"]}] Effective rate.</b> Federal + CA + FICA + CA SDI as a fraction of taxed W‑2 gross.</div>
       <div><b>[{FN["remaining-share"]}] Share of take-home.</b> Monthly remaining divided by monthly take-home.</div>
       <div><b>[{FN["pretax"]}] Pretax buckets.</b> 401k Traditional, HSA, transit FSA, dependent-care — leave the paycheck but lower the taxable base.</div>
       <div><b>[{FN["monthly-expenses"]}] Monthly expenses.</b> Sum of frequency-converted expense lines.</div>

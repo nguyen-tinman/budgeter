@@ -14,6 +14,9 @@ import {
   defaultProfile,
   detectModels,
   selectModelId,
+  detectGpu,
+  chooseSetupModel,
+  launchProfile,
   modelById,
   MODEL_REGISTRY,
   type LlamaProfile,
@@ -85,6 +88,10 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
     const detected = detectModels();
     const lastUsed = getSettings(opts).get(LAST_MODEL_KEY);
     const selected = selectModelId(detected, lastUsed);
+    // First-time setup has no "largest present" to prefer, so recommend by
+    // hardware instead of always shipping the smallest model.
+    const gpu = detectGpu();
+    const recommended = chooseSetupModel(gpu);
     return c.json({
       models: detected.map(({ spec, present }) => ({
         id: spec.id,
@@ -96,6 +103,9 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
       })),
       lastUsed,
       selected,
+      recommended: recommended.modelId,
+      recommendedReason: recommended.reason,
+      gpu,
     });
   });
 
@@ -117,9 +127,10 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
     }
     // `model` (a registry id) selects which GGUF to base the profile on; raw
     // profile fields in the body still override individual knobs on top of it.
-    // An unknown/absent id resolves to the default (2B) inside defaultProfile.
+    // An unknown/absent id resolves to the default (2B) inside launchProfile,
+    // which also decides whether MTP speculation fits this GPU.
     const { model, ...profileOverrides } = body;
-    const profile: LlamaProfile = { ...defaultProfile(model), ...profileOverrides };
+    const profile: LlamaProfile = { ...launchProfile(model), ...profileOverrides };
     const result = await getLauncher(opts).start(profile);
     // Persist the model we actually launched as last-used so the next startup
     // auto-launch + the Setup picker default reflect it. Only persist a known
@@ -167,7 +178,7 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
     // Persist BEFORE restart so a crash mid-restart still leaves the choice
     // recorded for the next auto-start.
     getSettings(opts).set(LAST_MODEL_KEY, spec.id);
-    const result = await getLauncher(opts).restart(defaultProfile(spec.id));
+    const result = await getLauncher(opts).restart(launchProfile(spec.id));
     return c.json({ ok: result.status !== "error", model: spec.id, ...result });
   });
 
@@ -184,7 +195,7 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
     } catch {
       /* keep last */
     }
-    const profile = body ? { ...defaultProfile(), ...body } : undefined;
+    const profile = body ? { ...launchProfile(), ...body } : undefined;
     const result = await getLauncher(opts).restart(profile);
     return c.json(result);
   });
@@ -222,7 +233,7 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
   // MODEL_REGISTRY. Allowing arbitrary `modelUrl` from the caller would let
   // any local process replace a GGUF with attacker bytes (the orchestrator
   // atomic-replaces the file at the fixed path). An unknown/absent id falls
-  // back to the bundled 2B inside the orchestrator.
+  // back to the VRAM-appropriate recommendation.
   router.post("/setup", async (c) => {
     let body: { model?: string } = {};
     try {
@@ -230,10 +241,12 @@ export function llamaRouter(opts: LlamaRouterOptions = {}): Hono {
     } catch {
       /* default model */
     }
-    // Only forward a known registry id; anything else is dropped so the
-    // orchestrator defaults to the 2B (it never sees a raw URL either way).
-    const modelId = body.model && modelById(body.model) ? body.model : undefined;
-    const r = startSetup(modelId ? { modelId } : {});
+    // Only forward a known registry id; anything else falls back to the
+    // hardware-appropriate default rather than unconditionally to the 2B.
+    const recommended = chooseSetupModel(detectGpu());
+    const modelId =
+      body.model && modelById(body.model) ? body.model : recommended.modelId;
+    const r = startSetup({ modelId });
     if (r.alreadyRunning) {
       return c.json(
         { ok: false, error: "already_running", state: getSetupStatus() },
@@ -312,7 +325,7 @@ export async function autoStartLlama(
       // No GGUF downloaded yet — expected on a fresh install. Stay quiet-ish.
       return { started: false, model: null, reason: "no_model_present" };
     }
-    const result = await getLauncher(opts).start(defaultProfile(modelId));
+    const result = await getLauncher(opts).start(launchProfile(modelId));
     if (result.status === "error") {
       return { started: false, model: modelId, reason: result.errorTail ?? "launch_error" };
     }

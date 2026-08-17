@@ -289,4 +289,68 @@ describe("MCP server — stdio JSON-RPC", () => {
     expect(rowsAfter.some((e) => e.label === "GateTest")).toBe(true);
     await mcp.close();
   }, 15_000);
+
+  // -------------------------------------------------------------------------
+  // The /custom page write auto-applies in the in-app chat ONLY. Over MCP it
+  // is an ordinary mutation and stays consent-gated — that asymmetry is the
+  // security property, so it gets its own test.
+  // -------------------------------------------------------------------------
+  it("set_custom_page still requires confirm over MCP; its readers do not", async () => {
+    const mcp = spawnMcp();
+    await mcp.request({ method: "initialize", params: {} });
+
+    const listed = (await mcp.request({ method: "tools/list" })) as {
+      result: {
+        tools: Array<{
+          name: string;
+          inputSchema: { properties: Record<string, unknown>; required?: string[] };
+        }>;
+      };
+    };
+    const byName = new Map(listed.result.tools.map((t) => [t.name, t]));
+    const setPage = byName.get("set_custom_page")!;
+    expect(setPage.inputSchema.properties).toHaveProperty("confirm");
+    expect(setPage.inputSchema.required).toContain("confirm");
+    for (const readOnly of ["get_custom_page", "query_transactions"]) {
+      expect(byName.get(readOnly)!.inputSchema.properties).not.toHaveProperty("confirm");
+    }
+
+    const definition = {
+      action: "set",
+      title: "MCP page",
+      queries: [{ id: "cats", tool: "list_categories", args: {} }],
+      render: 'bk.note(root, "hi");',
+    };
+
+    const refused = (await mcp.request({
+      method: "tools/call",
+      params: { name: "set_custom_page", arguments: definition },
+    })) as { error?: { code: number; data?: { code?: string } } };
+    expect(refused.error).toBeDefined();
+    expect(refused.error!.data?.code).toBe("needs_confirmation");
+
+    const blank = (await mcp.request({
+      method: "tools/call",
+      params: { name: "get_custom_page", arguments: {} },
+    })) as { result: { content: Array<{ text: string }> } };
+    expect((JSON.parse(blank.result.content[0]!.text) as { exists: boolean }).exists).toBe(false);
+
+    const ok = (await mcp.request({
+      method: "tools/call",
+      params: { name: "set_custom_page", arguments: { ...definition, confirm: true } },
+    })) as { result: { isError: boolean } };
+    expect(ok.result.isError).toBe(false);
+
+    const after = (await mcp.request({
+      method: "tools/call",
+      params: { name: "get_custom_page", arguments: {} },
+    })) as { result: { content: Array<{ text: string }> } };
+    const page = JSON.parse(after.result.content[0]!.text) as {
+      exists: boolean;
+      definition: { title: string };
+    };
+    expect(page.exists).toBe(true);
+    expect(page.definition.title).toBe("MCP page");
+    await mcp.close();
+  }, 15_000);
 });

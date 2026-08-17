@@ -14,16 +14,30 @@
 // crawler at runtime, just describe shapes for the LLM and MCP clients).
 // ---------------------------------------------------------------------------
 
+// `nullable: true` on any variant means an explicit JSON `null` is a legal
+// value for that field, distinct from omitting it — used by update_* tools
+// where null CLEARS a column and undefined leaves it alone.
 export type JsonSchema =
-  | { type: "string"; description?: string; enum?: string[]; default?: string; minLength?: number; maxLength?: number }
+  | {
+      type: "string";
+      description?: string;
+      enum?: string[];
+      default?: string;
+      minLength?: number;
+      maxLength?: number;
+      /** Anchored regex the value must match (see validateArgs). */
+      pattern?: string;
+      nullable?: boolean;
+    }
   | {
       type: "integer" | "number";
       description?: string;
       minimum?: number;
       maximum?: number;
       default?: number;
+      nullable?: boolean;
     }
-  | { type: "boolean"; description?: string; default?: boolean }
+  | { type: "boolean"; description?: string; default?: boolean; nullable?: boolean }
   | { type: "null"; description?: string }
   | {
       type: "array";
@@ -31,6 +45,7 @@ export type JsonSchema =
       description?: string;
       minItems?: number;
       maxItems?: number;
+      nullable?: boolean;
     }
   | {
       type: "object";
@@ -38,6 +53,7 @@ export type JsonSchema =
       required?: string[];
       additionalProperties?: boolean;
       description?: string;
+      nullable?: boolean;
     };
 
 // ---------------------------------------------------------------------------
@@ -179,6 +195,26 @@ export interface TaxRepo {
     ficaMedicareRate: number;
     retirementEffectiveTaxRate: number;
   };
+  /** Partial upsert of a workspace's tax_settings row.
+   *
+   *  UPDATE branch (row exists): only the fields actually supplied are
+   *  written; everything else keeps its stored value. Supplying nothing but
+   *  the workspaceId is a no-op → `{ saved: false, created: false }`.
+   *
+   *  INSERT branch (no row): `filing` AND `taxYear` are required (both are
+   *  NOT NULL with no schema default); omitted optional columns take their
+   *  schema DEFAULTs. Implementations must NOT use ON CONFLICT here — an
+   *  excluded.* upsert would clobber unspecified columns with defaults. */
+  setSettingsForWorkspace(args: {
+    workspaceId: number;
+    filing?: "single" | "mfj";
+    taxYear?: number;
+    caSdiRate?: number;
+    ssWageBaseDollars?: number;
+    ficaSsRate?: number;
+    ficaMedicareRate?: number;
+    retirementEffectiveTaxRate?: number;
+  }): { saved: boolean; created: boolean };
 }
 
 export type SavingsAccountType =
@@ -361,6 +397,94 @@ export interface TransactionRepo {
     postedDate: string;     // YYYY-MM-DD
     amountDollars: number;  // signed; charges are negative
   }>;
+  /** listChargeRows restricted to a posted_date window (both bounds inclusive,
+   *  both optional) and widened with the importer-assigned category + source
+   *  account. Feeds compute_category_baselines, which needs the category to
+   *  bucket a charge and the account type to build a RawTxn. Charges only
+   *  (amount_dollars < 0), same as listChargeRows. */
+  listChargeRowsInRange(
+    from?: string,
+    to?: string,
+  ): Array<{
+    merchantRaw: string;
+    merchantNormalized: string;
+    postedDate: string;     // YYYY-MM-DD
+    amountDollars: number;  // signed; charges are negative
+    categoryId: number | null;
+    accountType: string;
+  }>;
+  /** Filtered transaction search backing the search_transactions tool. All
+   *  filters are optional and AND-ed. `merchant` is a case-insensitive
+   *  SUBSTRING match against both the normalized and raw merchant forms;
+   *  `from`/`to` bound posted_date inclusively; `minAmountDollars` /
+   *  `maxAmountDollars` compare against |amount_dollars| so callers reason in
+   *  positive magnitudes regardless of sign; `includeCredits` (default false)
+   *  admits positive rows. `totalMatched` counts every matching row, not just
+   *  the returned page, so callers can report truncation. Rows come back
+   *  newest-first. */
+  search(args: {
+    merchant?: string;
+    from?: string;
+    to?: string;
+    categoryId?: number;
+    minAmountDollars?: number;
+    maxAmountDollars?: number;
+    includeCredits?: boolean;
+    limit: number;
+    offset: number;
+  }): {
+    rows: Array<{
+      postedDate: string;
+      merchantRaw: string;
+      merchantNormalized: string;
+      amountDollars: number;   // signed, as stored
+      categoryId: number | null;
+      accountType: string;
+    }>;
+    totalMatched: number;
+  };
+  /** Charge totals grouped by normalized merchant, biggest spend first.
+   *  Charges only; `totalDollars` is returned POSITIVE (the stored negatives
+   *  are negated). Optional posted_date window + category filter. */
+  topMerchants(args: {
+    from?: string;
+    to?: string;
+    categoryId?: number;
+    limit: number;
+  }): Array<{
+    merchantNormalized: string;
+    merchantRawSample: string;
+    txnCount: number;
+    totalDollars: number;   // positive
+    firstSeen: string;
+    lastSeen: string;
+  }>;
+  /** Grouped aggregation over the same filter surface as `search`, backing the
+   *  query_transactions tool (and through it the /custom page's charts). The
+   *  `groupBy` key selects a fixed SQL expression — day / week (Sunday-start
+   *  date) / month / dayOfWeek ('0'..'6') / category ('uncat' when null) /
+   *  merchant. `dayOfWeek` additionally FILTERS to one weekday. Sums are
+   *  `-amount_dollars`, so charges come back as positive spend and
+   *  `includeCredits: true` yields NET spend. `totalGroups` counts every group
+   *  the filter produced, not just the `limit` returned, so callers can report
+   *  truncation. Time keys sort ascending; category/merchant sort by sum
+   *  descending. */
+  aggregate(args: {
+    merchant?: string;
+    from?: string;
+    to?: string;
+    categoryId?: number;
+    minAmountDollars?: number;
+    maxAmountDollars?: number;
+    includeCredits?: boolean;
+    dayOfWeek?: number;
+    groupBy: "day" | "week" | "month" | "dayOfWeek" | "category" | "merchant";
+    metric: "sum" | "count" | "avg";
+    limit: number;
+  }): {
+    rows: Array<{ key: string; value: number; count: number }>;
+    totalGroups: number;
+  };
   /** Total transaction count across the whole table, used by the Library
    *  stats strip. */
   totalCount(): number;
@@ -411,6 +535,31 @@ export interface StatementImportsRepo {
   }): { importId: number; alreadyImported: boolean };
 }
 
+/** The assistant-authored /custom page definition, stored as two rows in the
+ *  `app_settings` KV table (`customPage.def` current, `customPage.prev` the
+ *  one-step undo). A purpose-scoped repo rather than the generic
+ *  AppSettingsRepo so the tool surface can write EXACTLY this document and
+ *  nothing else in that table — the write target is narrowed by construction,
+ *  with no key or path argument anywhere in the tool schema.
+ *
+ *  "Blank page" is the absence of `customPage.def`, not an empty document.
+ *  Callers run write/reset/revert inside `ctx.tx()` so the current→prev
+ *  snapshot and the new value land atomically (a user Stop mid-turn can never
+ *  leave a torn definition). */
+export interface CustomPageRepo {
+  /** Current definition, or null when the page is blank. */
+  read(): { definitionJson: string; updatedAt: string } | null;
+  /** The undo snapshot, or null when there is nothing to revert to. */
+  readPrev(): { definitionJson: string } | null;
+  /** prev ← current, def ← the new document. */
+  write(definitionJson: string): { updatedAt: string };
+  /** prev ← current, then DELETE def (back to blank). */
+  reset(): { hadDefinition: boolean };
+  /** Swap def ↔ prev, so pressing undo twice toggles between the last two
+   *  versions. `reverted: false` when no snapshot exists. */
+  revert(): { reverted: boolean; updatedAt: string | null };
+}
+
 /** Context passed to every tool handler. Source identifies the caller. */
 export interface ToolCtx {
   audit: AuditLogRepo;
@@ -424,6 +573,7 @@ export interface ToolCtx {
   categories: CategoriesRepo;
   transactions: TransactionRepo;
   statementImports: StatementImportsRepo;
+  customPage: CustomPageRepo;
   web: WebRepo;
   source: ToolSource;
   /** Run `fn` inside a single DB transaction (BEGIN/COMMIT, ROLLBACK on
@@ -466,7 +616,16 @@ export class ToolArgError extends Error {
   }
 }
 
+// Compiled `pattern` regexes, keyed by source. Patterns come ONLY from the
+// ToolDefs in this repo (never from caller input), so there is no ReDoS
+// surface here — keep it that way by writing anchored, backtracking-free
+// patterns when adding new ones.
+const RE_CACHE = new Map<string, RegExp>();
+
 export function validateArgs(schema: JsonSchema, value: unknown, path: string[] = []): void {
+  // Explicit-null gate, ahead of the type dispatch: a `nullable` field accepts
+  // JSON null as a real value (update_* tools use it to CLEAR a column).
+  if (value === null && (schema as { nullable?: boolean }).nullable === true) return;
   if (schema.type === "object") {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
       throw new ToolArgError(`expected object at ${path.join(".") || "<root>"}`, path);
@@ -511,6 +670,16 @@ export function validateArgs(schema: JsonSchema, value: unknown, path: string[] 
         `string length ${value.length} > maxLength ${schema.maxLength} at ${path.join(".")}`,
         path,
       );
+    }
+    if (schema.pattern !== undefined) {
+      let re = RE_CACHE.get(schema.pattern);
+      if (!re) { re = new RegExp(schema.pattern); RE_CACHE.set(schema.pattern, re); }
+      if (!re.test(value)) {
+        throw new ToolArgError(
+          `string "${value}" does not match pattern ${schema.pattern} at ${path.join(".")}`,
+          path,
+        );
+      }
     }
   } else if (schema.type === "integer" || schema.type === "number") {
     if (typeof value !== "number" || !Number.isFinite(value)) {

@@ -108,7 +108,8 @@ export function setModal(id: string | null): void {
 // full-page reload, no stale tables.
 //
 // Resource names are stable strings the server and clients agree on:
-//   "incomes", "expenses", "savings", "takeHome", "workspaces", "retirement"
+//   "incomes", "expenses", "savings", "takeHome", "workspaces", "retirement",
+//   "statements", "customPage"
 //
 // Plain Set of listeners — no library, no lifecycle magic. Pages must call
 // the disposer returned from `onInvalidate` on teardown (Svelte 5: return it
@@ -121,7 +122,10 @@ export type ResourceName =
   | "takeHome"
   | "workspaces"
   | "retirement"
-  | "statements";
+  | "statements"
+  /** The assistant-authored /custom page definition itself (not the data it
+   *  queries) — fired by set_custom_page so /custom reloads the document. */
+  | "customPage";
 
 type InvalidateListener = (resource: ResourceName) => void;
 
