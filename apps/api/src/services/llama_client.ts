@@ -52,13 +52,23 @@ export const LLAMA_STREAM_FETCH_OPTIONS = {
 export const llamaBlockingDispatcher = new Agent(LLAMA_BLOCKING_FETCH_OPTIONS);
 export const llamaStreamingDispatcher = new Agent(LLAMA_STREAM_FETCH_OPTIONS);
 
-/** `RequestInit` plus undici's dispatcher. Tests stub `fetch` and assert
- *  the Agent; the default fetcher actually uses it. */
-export type LlamaFetchInit = RequestInit & { dispatcher?: Agent };
+/** Fetch init for llama-server. Kept off DOM/`undici-types` `RequestInit` so
+ *  the npm `undici` Agent (v7) does not collide with `@types/node`'s v6
+ *  dispatcher types. Tests stub `fetch` and assert `dispatcher`. */
+export interface LlamaFetchInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  signal?: AbortSignal;
+  dispatcher?: Agent;
+}
 
 function defaultLlamaFetch(url: string, init?: LlamaFetchInit): Promise<Response> {
   return undiciFetch(url, {
-    ...init,
+    method: init?.method,
+    headers: init?.headers,
+    body: init?.body,
+    signal: init?.signal,
     dispatcher: init?.dispatcher ?? llamaBlockingDispatcher,
   }) as unknown as Promise<Response>;
 }
