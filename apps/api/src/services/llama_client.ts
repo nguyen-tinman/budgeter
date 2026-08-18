@@ -8,7 +8,60 @@
 // We surface the raw response so /api/chat can fall back to "chat-only" mode
 // when no tool_calls show up after a system-prompt nudge.
 
+import { Agent, fetch as undiciFetch } from "undici";
 import type { JsonSchema, ToolDef } from "@budgetkit/core";
+
+/** Timeout policy for llama-server HTTP. Must stay the single source of
+ *  truth for both the chat-route AbortSignal wrappers and the undici
+ *  Agent below — Node's default headersTimeout is 300s, and llama-server
+ *  only writes response headers when a *blocking* completion finishes. */
+export const LLAMA_CALL_BASE_TIMEOUT_MS = 60_000;
+/** Per-reply-token allowance for blocking calls (~33 tok/s floor). */
+export const LLAMA_MS_PER_REPLY_TOKEN = 30;
+/** Streaming: max gap between chunks before the server is presumed dead. */
+export const LLAMA_STREAM_IDLE_TIMEOUT_MS = 60_000;
+/** Streaming: window for the FIRST chunk (prompt prefill). Matches the
+ *  launcher's startup health deadline. */
+export const LLAMA_STREAM_FIRST_CHUNK_TIMEOUT_MS = 180_000;
+/** Reply budget the chat route actually requests. The blocking fetch
+ *  dispatcher is sized for this so a 16k-token CPU completion cannot die
+ *  at undici's 300s default. */
+export const LLAMA_REPLY_TOKEN_CEILING = 16_384;
+
+/** Wall-clock ceiling for a BLOCKING llama call expected to emit up to
+ *  `maxTokens` reply tokens. */
+export function llamaCallTimeoutMs(maxTokens: number): number {
+  return LLAMA_CALL_BASE_TIMEOUT_MS + maxTokens * LLAMA_MS_PER_REPLY_TOKEN;
+}
+
+/** Options passed to the blocking-completion Agent. Exported so tests can
+ *  assert the timeouts without poking undici internals. */
+export const LLAMA_BLOCKING_FETCH_OPTIONS = {
+  headersTimeout: llamaCallTimeoutMs(LLAMA_REPLY_TOKEN_CEILING),
+  bodyTimeout: llamaCallTimeoutMs(LLAMA_REPLY_TOKEN_CEILING),
+} as const;
+
+/** Streaming Agent: wait for headers up to the first-chunk window, then
+ *  do not cap the body — a healthy stream can outlive 300s. Liveness is
+ *  the chat route's inter-chunk idle AbortSignal. */
+export const LLAMA_STREAM_FETCH_OPTIONS = {
+  headersTimeout: LLAMA_STREAM_FIRST_CHUNK_TIMEOUT_MS,
+  bodyTimeout: 0,
+} as const;
+
+export const llamaBlockingDispatcher = new Agent(LLAMA_BLOCKING_FETCH_OPTIONS);
+export const llamaStreamingDispatcher = new Agent(LLAMA_STREAM_FETCH_OPTIONS);
+
+/** `RequestInit` plus undici's dispatcher. Tests stub `fetch` and assert
+ *  the Agent; the default fetcher actually uses it. */
+export type LlamaFetchInit = RequestInit & { dispatcher?: Agent };
+
+function defaultLlamaFetch(url: string, init?: LlamaFetchInit): Promise<Response> {
+  return undiciFetch(url, {
+    ...init,
+    dispatcher: init?.dispatcher ?? llamaBlockingDispatcher,
+  }) as unknown as Promise<Response>;
+}
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -132,10 +185,14 @@ export function defaultLlamaUrl(): string {
 /**
  * Create a default HTTP-backed client. `fetcher` is parameterizable so tests
  * can stub the network without monkey-patching globalThis.fetch.
+ *
+ * Default fetch is undici's, not globalThis.fetch, so the Agent's
+ * headersTimeout/bodyTimeout actually apply. Node's built-in fetch uses a
+ * different undici copy and would ignore an npm-undici Agent.
  */
 export function createLlamaClient(
   baseUrl: string = defaultLlamaUrl(),
-  fetcher: typeof fetch = fetch,
+  fetcher: (url: string, init?: LlamaFetchInit) => Promise<Response> = defaultLlamaFetch,
 ): LlamaClient {
   return {
     baseUrl,
@@ -146,6 +203,7 @@ export function createLlamaClient(
         headers: { "content-type": "application/json" },
         body: JSON.stringify(req),
         signal,
+        dispatcher: llamaBlockingDispatcher,
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
@@ -160,6 +218,7 @@ export function createLlamaClient(
         headers: { "content-type": "application/json", accept: "text/event-stream" },
         body: JSON.stringify({ ...req, stream: true }),
         signal,
+        dispatcher: llamaStreamingDispatcher,
       });
       if (!res.ok || !res.body) {
         const text = res.body ? await res.text().catch(() => "") : "";
