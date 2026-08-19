@@ -353,7 +353,7 @@ describe("LlamaLauncher — prompt-prefix cache at start", () => {
             restoreCalls++;
             return { id_slot: 0, filename, n_restored: 1 };
           },
-          saveSlot: async (filename) => {
+          saveSlot: async (_id, filename) => {
             writeFileSync(join(dir, filename), "kv");
             return { id_slot: 0, filename, n_saved: 1 };
           },
