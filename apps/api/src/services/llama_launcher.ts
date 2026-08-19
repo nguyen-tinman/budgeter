@@ -7,12 +7,13 @@
 // binary. Production passes child_process.spawn.
 
 import { spawn as nodeSpawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { createServer } from "node:net";
 import { cpus } from "node:os";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createLlamaClient, type LlamaClient } from "./llama_client.js";
+import { createLlamaClient, type ChatRequest, type LlamaClient } from "./llama_client.js";
+import { ensurePromptPrefixCached } from "./llama_prompt_cache.js";
 
 /**
  * Find the BudgetKit project root by walking up from this source file until
@@ -658,6 +659,12 @@ export interface LlamaProfile {
    *  "auto" picks 4. For a single-user app we only need 1 — the extra slots
    *  reserve KV cache + recurrent state we never use. */
   nParallel?: number;
+  /**
+   * `--slot-save-path`. Directory llama-server uses for POST /slots/{id}?action=save|restore.
+   * Must already exist at spawn (b10456 throws `not a directory`). Default is
+   * `data/llama-prompt-cache/` under the project root.
+   */
+  slotSavePath?: string;
   // Sampler defaults are passed via --sampling-config on llama-server, or
   // sent per-request via the chat API. We keep them on the profile for
   // future per-profile request defaults.
@@ -678,6 +685,16 @@ export interface LaunchResult {
 }
 
 export type SpawnFn = typeof nodeSpawn;
+
+/** On-disk slot KV directory. llama-server b10456 requires this path to
+ *  exist before `--slot-save-path` is accepted. */
+export function defaultPromptCacheDir(): string {
+  return fromProjectRoot("data/llama-prompt-cache");
+}
+
+export function resolveSlotSavePath(profile: LlamaProfile): string {
+  return profile.slotSavePath ?? defaultPromptCacheDir();
+}
 
 /** Construct the CLI args for llama-server from a profile. Pure. */
 export function buildArgs(profile: LlamaProfile): string[] {
@@ -748,6 +765,10 @@ export function buildArgs(profile: LlamaProfile): string[] {
   if (profile.nParallel !== undefined) {
     args.push("--parallel", String(profile.nParallel));
   }
+  // Confirmed on llama-server b10456 `--help`: `--slot-save-path PATH`
+  // enables POST /slots/{id}?action=save|restore. `--slots` (GET /slots)
+  // is already default-on and is not required for save/restore.
+  args.push("--slot-save-path", resolveSlotSavePath(profile));
   // Sampler defaults — server-level fallback. Per-request values from
   // /api/chat or the OpenAI-compatible body will still override these.
   args.push("--temp", String(profile.temperature));
@@ -773,6 +794,14 @@ export interface LauncherOptions {
    *  Defaults to a real on-disk check; tests inject presence so the fallback
    *  policy can be exercised without multi-GB files. */
   modelPresent?: PresenceFn;
+  /** Override warmup prompt construction (tests). Production loads
+   *  `wrappedSystemPrompt` + `chatRequestOptions` from the chat route. */
+  promptCache?: {
+    getSystemPrompt?: () => string | Promise<string>;
+    getRequestDefaults?: () =>
+      | Omit<ChatRequest, "messages">
+      | Promise<Omit<ChatRequest, "messages">>;
+  };
 }
 
 export class LlamaLauncher {
@@ -991,6 +1020,20 @@ export class LlamaLauncher {
     this.profile = profile;
     this.status = "starting";
     this.lastError = null;
+    // b10456: `--slot-save-path` is rejected unless PATH is already a
+    // directory (`not a directory: …` at parse time). Create it first so a
+    // missing cache dir cannot take down the launch.
+    const cacheDir = resolveSlotSavePath(profile);
+    try {
+      mkdirSync(cacheDir, { recursive: true });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[llama-launcher] could not create slot-save-path ${cacheDir}: ${(err as Error).message}`,
+      );
+    }
+    profile = { ...profile, slotSavePath: cacheDir };
+    this.profile = profile;
     const args = buildArgs(profile);
     const spawnFn = this.opts.spawnFn ?? nodeSpawn;
     const proc = spawnFn(bin, args, {
@@ -1024,6 +1067,29 @@ export class LlamaLauncher {
       if (!this.proc) break;
       const h = await client.health();
       if (h.ok) {
+        try {
+          const cache = await ensurePromptPrefixCached({
+            client,
+            profile: { ...profile, slotSavePath: cacheDir },
+            getSystemPrompt: this.opts.promptCache?.getSystemPrompt,
+            getRequestDefaults: this.opts.promptCache?.getRequestDefaults,
+          });
+          if (cache.action !== "skipped") {
+            // eslint-disable-next-line no-console
+            console.log(
+              `[llama-launcher] prompt-prefix cache ${cache.action}` +
+                (cache.reason ? ` (${cache.reason})` : ""),
+            );
+          } else if (cache.reason) {
+            // eslint-disable-next-line no-console
+            console.warn(`[llama-launcher] prompt-prefix cache skipped: ${cache.reason}`);
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[llama-launcher] prompt-prefix cache skipped: ${err instanceof Error ? err.message : err}`,
+          );
+        }
         this.status = "ready";
         return { status: "ready", url: this.resolveUrl(), pid: proc.pid ?? null };
       }
@@ -1231,6 +1297,7 @@ export function defaultProfile(
     // so "off" is specType "none".
     specDraftNMax: speculation.specDraftNMax,
     nParallel: 1,
+    slotSavePath: defaultPromptCacheDir(),
     // Qwen3.5 recommended sampler settings for "precise coding" / agentic
     // tool-calling workloads (per unsloth's published guidance).
     //   temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, repeat_penalty=1.0

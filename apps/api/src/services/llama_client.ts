@@ -167,6 +167,16 @@ export interface ChatStreamChunk {
   choices: ChatStreamChunkChoice[];
 }
 
+/** Result of POST /slots/{id}?action=save|restore (llama-server b10456). */
+export interface SlotSaveRestoreResult {
+  id_slot: number;
+  filename: string;
+  n_saved?: number;
+  n_restored?: number;
+  n_written?: number;
+  n_read?: number;
+}
+
 export interface LlamaClient {
   baseUrl: string;
   chat: (req: ChatRequest, signal?: AbortSignal) => Promise<ChatResponse>;
@@ -182,6 +192,21 @@ export interface LlamaClient {
     signal?: AbortSignal,
   ) => AsyncIterable<ChatStreamChunk>;
   health: (signal?: AbortSignal) => Promise<{ ok: boolean; status: number }>;
+  /**
+   * Persist slot KV to `--slot-save-path` / `filename`. Optional so test stubs
+   * that only implement `chat`/`health` still typecheck; production
+   * `createLlamaClient` always provides both slot methods.
+   */
+  saveSlot?: (
+    idSlot: number,
+    filename: string,
+    signal?: AbortSignal,
+  ) => Promise<SlotSaveRestoreResult>;
+  restoreSlot?: (
+    idSlot: number,
+    filename: string,
+    signal?: AbortSignal,
+  ) => Promise<SlotSaveRestoreResult>;
 }
 
 export function defaultLlamaUrl(): string {
@@ -286,7 +311,39 @@ export function createLlamaClient(
         return { ok: false, status: 0 };
       }
     },
+    async saveSlot(idSlot, filename, signal) {
+      return slotAction(baseUrl, fetcher, idSlot, "save", filename, signal);
+    },
+    async restoreSlot(idSlot, filename, signal) {
+      return slotAction(baseUrl, fetcher, idSlot, "restore", filename, signal);
+    },
   };
+}
+
+/**
+ * llama-server b10456: POST /slots/{id_slot}?action=save|restore with
+ * `{ filename }` (basename only; the file lands under `--slot-save-path`).
+ */
+async function slotAction(
+  baseUrl: string,
+  fetcher: typeof fetch,
+  idSlot: number,
+  action: "save" | "restore",
+  filename: string,
+  signal?: AbortSignal,
+): Promise<SlotSaveRestoreResult> {
+  const url = `${baseUrl.replace(/\/+$/, "")}/slots/${idSlot}?action=${action}`;
+  const res = await fetcher(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ filename }),
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`llama slot ${action} failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+  return (await res.json()) as SlotSaveRestoreResult;
 }
 
 /**

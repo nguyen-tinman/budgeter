@@ -63,6 +63,19 @@ describe("llama_launcher — buildArgs (pure)", () => {
     expect(args[i + 1]).toBe("auto");
   });
 
+  it("passes --slot-save-path so POST /slots/{id}?action=save|restore can persist KV", () => {
+    // Confirmed on llama-server b10456 `--help`. The directory is created
+    // before spawn; the flag value is the profile path (or the project default).
+    const args = buildArgs({
+      ...defaultProfile(),
+      slotSavePath: "/tmp/llama-prompt-cache",
+    });
+    const i = args.indexOf("--slot-save-path");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(args[i + 1]).toBe("/tmp/llama-prompt-cache");
+    expect(args).not.toContain("--slots");
+  });
+
   it("omits --no-mmap / --mlock when nGpuLayers > 0 (GPU path)", () => {
     const args = buildArgs({
       ...defaultProfile(),

@@ -977,7 +977,9 @@ export function buildSystemMessage(opts: {
 }
 
 /** The static rules, tagged. Kept identical on every turn — it is the head of
- *  the prompt-cache prefix, so any variation here re-prefills everything. */
+ *  the prompt-cache prefix, so any variation here re-prefills everything.
+ *  Boot-time slot KV warmup (`llama_prompt_cache.ts`) sends this exact string
+ *  plus `toolsToOpenAi(ALL_TOOLS)` so a restored cache matches a live turn. */
 export function wrappedSystemPrompt(): string {
   return `<SYSTEM_PROMPT>\n${SYSTEM_PROMPT}\n</SYSTEM_PROMPT>`;
 }
@@ -1555,8 +1557,9 @@ export function resetApprovedActionReplayGuard(): void {
 }
 
 /** Standard chat-completion request options shared by both paths so the
- *  sampler/template behavior is identical streaming vs not. */
-function chatRequestOptions(): Omit<Parameters<LlamaClient["chat"]>[0], "messages"> {
+ *  sampler/template behavior is identical streaming vs not. Exported so the
+ *  boot-time prefix warmup uses the same tool_choice / thinking kwargs. */
+export function chatRequestOptions(): Omit<Parameters<LlamaClient["chat"]>[0], "messages"> {
   return {
     tool_choice: "auto",
     // Qwen3.5 "precise coding / agentic" preset (per unsloth docs).
