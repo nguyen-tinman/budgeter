@@ -26,8 +26,9 @@ import {
 export const SLOT_CACHE_FILENAME = "prefix.slot.bin";
 export const PROMPT_CACHE_META_FILENAME = "prefix.meta.json";
 
-/** Dummy user turn appended AFTER the static prefix. A real /api/chat request
- *  diverges here, so llama.cpp still shares system + tools. */
+/** Dummy user turn appended AFTER the static single-system prefix. A real
+ *  /api/chat request diverges here (workspace/page/guide sit in a non-system
+ *  tail), so llama.cpp still shares system + tools. */
 export const WARMUP_TAIL_USER = ".";
 
 /** Slot 0 is the only slot (`nParallel: 1`). */
@@ -155,8 +156,10 @@ export function writePromptCacheMeta(cacheDir: string, identity: PromptCacheIden
 
 /**
  * Warmup completion whose prefix is the same functions a real chat turn uses:
- * `wrappedSystemPrompt()` + `toolsToOpenAi(ALL_TOOLS)` + the chat route's
- * template kwargs. `requestDefaults` is `chatRequestOptions()` in production.
+ * exactly one leading `system` (`wrappedSystemPrompt()`) + `toolsToOpenAi(ALL_TOOLS)`
+ * + the chat route's template kwargs. No workspace/page/guide — those are
+ * volatile and live in a non-system tail so Qwen cannot merge them into the
+ * warmed system block. `requestDefaults` is `chatRequestOptions()` in production.
  */
 export function buildStaticPrefixWarmupRequest(
   systemPrompt: string,

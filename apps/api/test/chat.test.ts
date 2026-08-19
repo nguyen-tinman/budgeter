@@ -6,12 +6,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Hono } from "hono";
-import type {
-  ChatRequest,
-  ChatResponse,
-  ChatStreamChunk,
-  LlamaClient,
+import {
+  toolsToOpenAi,
+  type ChatRequest,
+  type ChatResponse,
+  type ChatStreamChunk,
+  type LlamaClient,
 } from "../src/services/llama_client.js";
+import { buildStaticPrefixWarmupRequest } from "../src/services/llama_prompt_cache.js";
 import {
   buildSystemMessage,
   buildContextMessage,
@@ -23,8 +25,11 @@ import {
   isContextOverflowError,
   overflowTokensFromError,
   compactInFlight,
+  CONTEXT_MESSAGE_ROLE,
+  wrappedSystemPrompt,
+  chatRequestOptions,
 } from "../src/routes/chat.js";
-import { CUSTOM_PAGE_GUIDE } from "@budgetkit/core";
+import { ALL_TOOLS, CUSTOM_PAGE_GUIDE } from "@budgetkit/core";
 
 // Chars of message content guaranteed to exceed the compaction threshold,
 // derived from the live budget so these tests don't drift when the context
@@ -518,20 +523,23 @@ describe("POST /api/chat — auto-compaction", () => {
     // summarization transcript — those go to the main turn instead.
     expect(summCall!.messages[1]!.content).not.toMatch(/turn 32:/);
 
-    // Main turn: a static system head plus one situational block, with the
-    // kept-recent tail (8 entries) between them and the new user message.
+    // Main turn: exactly one system head, plus a non-system situational
+    // block, with the kept-recent tail (8 entries) between them and the
+    // new user message.
     const systemMsgs = mainCall!.messages.filter((m) => m.role === "system");
-    expect(systemMsgs).toHaveLength(2);
-    const userAsstMsgs = mainCall!.messages.filter(
-      (m) => m.role === "user" || m.role === "assistant",
+    expect(systemMsgs).toHaveLength(1);
+    const conversation = mainCall!.messages.filter(
+      (m) =>
+        (m.role === "user" || m.role === "assistant") &&
+        !String(m.content).includes("<PRIOR_CONVERSATION_SUMMARY>"),
     );
     // 8 kept-recent + 1 new user message = 9.
-    expect(userAsstMsgs).toHaveLength(9);
-    // The merged system message must include the fresh priorSummary
-    // wrapped in its delimited block.
-    const situational = String(systemMsgs[1]!.content);
-    expect(situational).toMatch(/<PRIOR_CONVERSATION_SUMMARY>/);
-    expect(situational).toMatch(/Earlier turns covered/);
+    expect(conversation).toHaveLength(9);
+    const situational = mainCall!.messages.find((m) =>
+      String(m.content).includes("<PRIOR_CONVERSATION_SUMMARY>"),
+    );
+    expect(situational?.role).toBe(CONTEXT_MESSAGE_ROLE);
+    expect(String(situational!.content)).toMatch(/Earlier turns covered/);
   });
 
   it("caps the emitted priorSummary when the summarizer returns an over-budget summary (B5)", async () => {
@@ -607,8 +615,8 @@ describe("POST /api/chat — auto-compaction", () => {
     // guard must travel in the SAME message as the untrusted text it governs.
     expect(client.calls).toHaveLength(1);
     const systemMsgs = client.calls[0]!.messages.filter((m) => m.role === "system");
-    expect(systemMsgs).toHaveLength(2);
-    const sys = systemMsgs.map((m) => String(m.content)).join("\n\n");
+    expect(systemMsgs).toHaveLength(1);
+    const sys = assembledInstructions(client.calls[0]!.messages);
     expect(sys).toMatch(/<SYSTEM_PROMPT>/);
     expect(sys).toMatch(/<\/SYSTEM_PROMPT>/);
     expect(sys).toMatch(/<PRIOR_CONVERSATION_SUMMARY>/);
@@ -1218,18 +1226,31 @@ function capturingClient(responses: ChatResponse[]): {
   };
 }
 
-/** Everything the route told the model in system role on its first call.
- *  Joined because the prompt is deliberately split into a static head and a
- *  situational tail (see buildContextMessage) — these tests assert WHAT the
- *  model was told; the split itself is asserted in "prompt layout" below. */
+/** Static head + situational tail the route told the model. Joined because
+ *  the prompt is deliberately split (see buildContextMessage) — these tests
+ *  assert WHAT the model was told; the split itself is asserted in
+ *  "prompt layout" below. The tail is not system-role (Qwen 3.5 merge). */
+function assembledInstructions(messages: ChatRequest["messages"]): string {
+  return messages
+    .filter((m) => {
+      if (m.role === "system") return true;
+      const c = String(m.content ?? "");
+      return (
+        c.includes("<WORKSPACE_DATA>") ||
+        c.includes("<PRIOR_CONVERSATION_SUMMARY>") ||
+        c.includes("<CUSTOM_PAGE_STATUS>") ||
+        c.includes("<CUSTOM_PAGE_AUTHORING>")
+      );
+    })
+    .map((m) => String(m.content ?? ""))
+    .join("\n\n");
+}
+
 function firstSystemMessage(requests: ChatRequest[]): string {
   const first = requests[0];
   expect(first).toBeDefined();
   expect(first!.messages[0]?.role).toBe("system");
-  return first!.messages
-    .filter((m) => m.role === "system")
-    .map((m) => String(m.content ?? ""))
-    .join("\n\n");
+  return assembledInstructions(first!.messages);
 }
 
 describe("buildWorkspaceSummary — truncation preserves every header line", () => {
@@ -1760,7 +1781,8 @@ describe("prompt layout — prompt-cache prefix stability", () => {
     // so the whole conversation ahead of it stays inside the cached prefix.
     expect(msgs[msgs.length - 1]!.role).toBe("user");
     const situational = msgs[msgs.length - 2]!;
-    expect(situational.role).toBe("system");
+    expect(situational.role).toBe(CONTEXT_MESSAGE_ROLE);
+    expect(situational.role).not.toBe("system");
     expect(String(situational.content)).toContain("DistinctiveRentLabel");
   });
 
@@ -1777,10 +1799,7 @@ describe("prompt layout — prompt-cache prefix stability", () => {
       String(requests[0]!.messages[0]!.content),
     );
     // ...and the change did reach the model, in the tail.
-    const tail = requests[1]!.messages
-      .filter((m) => m.role === "system")
-      .map((m) => String(m.content))
-      .join("\n\n");
+    const tail = assembledInstructions(requests[1]!.messages);
     expect(tail).toContain("AddedBetweenTurns");
   });
 
@@ -1809,8 +1828,32 @@ describe("prompt layout — prompt-cache prefix stability", () => {
 
     const msgs = requests[0]!.messages;
     expect(String(msgs[0]!.content)).not.toContain("PostApprovalLabel");
-    const situational = msgs.filter((m) => m.role === "system").at(-1)!;
-    expect(String(situational.content)).toContain("PostApprovalLabel");
+    const situational = msgs.find((m) => String(m.content).includes("PostApprovalLabel"));
+    expect(situational?.role).toBe(CONTEXT_MESSAGE_ROLE);
+    expect(situational?.role).not.toBe("system");
+  });
+
+  it("warmup leading system + tools + kwargs is a prefix of a live first turn with context", async () => {
+    // First turn, empty history, workspace + page-status context present —
+    // the shape that used to be [system, system, user] and got merged.
+    const { client, requests } = recordingClient([asstText("ok")]);
+    const app = await freshApp(client);
+    await seedExpense("PrefixCheckRent", 2000);
+    await send(app, "hi");
+
+    const live = requests[0]!;
+    const warmup = buildStaticPrefixWarmupRequest(wrappedSystemPrompt(), chatRequestOptions());
+    expect(live.messages[0]).toEqual(warmup.messages[0]);
+    expect(live.messages.filter((m) => m.role === "system")).toHaveLength(1);
+    expect(live.messages[1]?.role).not.toBe("system");
+    expect(live.tools).toEqual(warmup.tools);
+    expect(live.tools).toEqual(toolsToOpenAi(ALL_TOOLS));
+    expect(live.chat_template_kwargs).toEqual(warmup.chat_template_kwargs);
+    const context = live.messages.find(
+      (m, i) => i > 0 && String(m.content).includes("PrefixCheckRent"),
+    );
+    expect(context).toBeDefined();
+    expect(context!.role).toBe(CONTEXT_MESSAGE_ROLE);
   });
 });
 
@@ -1956,7 +1999,7 @@ describe("compactInFlight", () => {
     const history = [
       { role: "system" as const, content: "<SYSTEM_PROMPT>rules</SYSTEM_PROMPT>" },
       ...settled,
-      { role: "system" as const, content: "<WORKSPACE_DATA>numbers</WORKSPACE_DATA>" },
+      { role: CONTEXT_MESSAGE_ROLE, content: "<WORKSPACE_DATA>numbers</WORKSPACE_DATA>" },
       { role: "user" as const, content: "current question" },
       {
         role: "assistant" as const,

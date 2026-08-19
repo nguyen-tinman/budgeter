@@ -985,6 +985,18 @@ export function wrappedSystemPrompt(): string {
 }
 
 /**
+ * Role for the situational tail (workspace / page status / authoring guide).
+ *
+ * Must not be `system`. Qwen 3.5's chat template merges `messages[0]` and
+ * `messages[1]` when both are system (first + newline + second) and, when
+ * `tools` is set, emits one system block: `# Tools` + the full catalog, then
+ * `merged_system`. A second leading system therefore extends the warmed
+ * `<|im_start|>system … <|im_end|>` instead of appending after it — the
+ * boot slot is then not a rewind point of a live `/api/chat` turn.
+ */
+export const CONTEXT_MESSAGE_ROLE = "user" as const;
+
+/**
  * The volatile half of the prompt: workspace numbers, the folded summary, what
  * the custom page reported, and any task-specific authoring help. Returns ""
  * when there is nothing situational to say.
@@ -998,6 +1010,10 @@ export function wrappedSystemPrompt(): string {
  * reprocessed per turn, versus 20 with this block moved to the tail (255ms →
  * 84ms). Placing it just before the newest user message keeps the whole
  * conversation inside the cached prefix.
+ *
+ * It is also a non-system message (see CONTEXT_MESSAGE_ROLE). A second
+ * `role: "system"` would be merged into the leading system block by Qwen 3.5
+ * and the boot-time slot KV would no longer be a prefix of a live turn.
  *
  * The "treat as data" boundary travels WITH the blocks it governs, so the
  * instruction still sits in the same message as the untrusted text.
@@ -1490,10 +1506,11 @@ interface PreparedTurn {
    *  rebuilds the context block and must not silently drop these. */
   customPageStatus: CustomPageStatus | null;
   customPageAuthoring: string | null;
-  /** Index of the situational-context system message inside `history`, or null
+  /** Index of the situational-context message inside `history`, or null
    *  when the turn had nothing situational to say. It sits immediately before
-   *  the newest user message; everything the loop appends goes after that, so
-   *  the index stays valid for the life of the request. */
+   *  the newest user message (role `CONTEXT_MESSAGE_ROLE`, not system);
+   *  everything the loop appends goes after that, so the index stays valid
+   *  for the life of the request. */
   contextIndex: number | null;
   /** Snapshot taken at the start of this request, if any. Discarded at the
    *  end of the turn unless a successful mutation actually landed. */
@@ -1611,7 +1628,7 @@ function refreshWorkspaceSystemMessage(prepared: PreparedTurn): void {
   // rules and must never change (see buildContextMessage).
   if (prepared.contextIndex === null) return;
   const block = prepared.history[prepared.contextIndex];
-  if (!block || block.role !== "system") return;
+  if (!block || block.role !== CONTEXT_MESSAGE_ROLE) return;
   const workspaceSummary = buildWorkspaceSnapshotBlock(
     prepared.db,
     prepared.ctx,
@@ -1716,7 +1733,7 @@ export async function compactInFlight(
         if (prepared.contextIndex !== null) {
           prepared.contextIndex -= removed;
           const block = history[prepared.contextIndex];
-          if (block && block.role === "system") {
+          if (block && block.role === CONTEXT_MESSAGE_ROLE) {
             block.content = buildContextMessage({
               workspaceSummary: buildWorkspaceSnapshotBlock(prepared.db, prepared.ctx, prepared.workspaceId),
               priorSummary: prepared.priorSummary,
@@ -1893,8 +1910,8 @@ async function prepareTurn(
   }
 
   // Pre-bake a snapshot of the active workspace (same takeHome + frequency
-  // math the UI uses). Folded into ONE merged system message — see
-  // buildSystemMessage().
+  // math the UI uses). Lives on the situational tail — not the static
+  // system head — so it cannot extend the warmed Qwen system block.
   const workspaceSummary = buildWorkspaceSnapshotBlock(db, ctx, body.workspaceId);
   // The page's last word from the browser. Injected on EVERY turn, clean or
   // not, so "no errors on custom page" is a statement rather than an absence.
@@ -2001,7 +2018,8 @@ async function prepareTurn(
   // buildContextMessage for the measurement behind the split. The head is
   // always the tagged form so it is byte-identical on every turn; letting it
   // toggle between tagged and bare would re-prefill the whole prompt on the
-  // turn it flipped.
+  // turn it flipped. The tail is NOT a second system message: Qwen 3.5
+  // merges two leading systems into one block (see CONTEXT_MESSAGE_ROLE).
   const contextBlock = buildContextMessage({
     workspaceSummary,
     priorSummary,
@@ -2011,7 +2029,7 @@ async function prepareTurn(
   const history: ChatMessage[] = [
     { role: "system", content: wrappedSystemPrompt() },
     ...historyMessages,
-    ...(contextBlock ? [{ role: "system" as const, content: contextBlock }] : []),
+    ...(contextBlock ? [{ role: CONTEXT_MESSAGE_ROLE, content: contextBlock }] : []),
     { role: "user", content: body.message },
   ];
   // Where the context block landed, so a post-mutation refresh can rewrite it

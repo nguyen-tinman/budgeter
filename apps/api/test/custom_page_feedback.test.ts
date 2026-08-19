@@ -99,13 +99,22 @@ async function ask(app: Hono, message: string): Promise<Response> {
   });
 }
 
-/** Everything the turn said in system role. The prompt is deliberately split
- *  into a static head and a situational tail (see buildContextMessage — the
- *  tail placement is what keeps llama.cpp's prompt cache warm), and these tests
- *  are about WHAT the model was told, not where it sat. */
+/** Static head + situational tail. The prompt is deliberately split
+ *  (see buildContextMessage — tail placement keeps llama.cpp's prompt cache
+ *  warm; the tail is not system-role so Qwen 3.5 cannot merge it). These
+ *  tests assert WHAT the model was told, not where it sat. */
 function systemOf(client: { requests: ChatRequest[] }): string {
   return client.requests[0]!.messages
-    .filter((m) => m.role === "system")
+    .filter((m) => {
+      if (m.role === "system") return true;
+      const c = String(m.content ?? "");
+      return (
+        c.includes("<WORKSPACE_DATA>") ||
+        c.includes("<PRIOR_CONVERSATION_SUMMARY>") ||
+        c.includes("<CUSTOM_PAGE_STATUS>") ||
+        c.includes("<CUSTOM_PAGE_AUTHORING>")
+      );
+    })
     .map((m) => String(m.content ?? ""))
     .join("\n\n");
 }
