@@ -333,7 +333,7 @@ export function createLlamaClient(
  */
 async function slotAction(
   baseUrl: string,
-  fetcher: typeof fetch,
+  fetcher: (url: string, init?: LlamaFetchInit) => Promise<Response>,
   idSlot: number,
   action: "save" | "restore",
   filename: string,
