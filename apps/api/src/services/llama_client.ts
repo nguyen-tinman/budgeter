@@ -299,14 +299,21 @@ export function createLlamaClient(
     },
     async health(signal) {
       try {
-        // llama-server exposes /health; kobold.cpp exposes /api/v1/info — we
-        // probe /health first and fall back to a HEAD on the root.
-        const tries = [`${baseUrl.replace(/\/+$/, "")}/health`, baseUrl];
-        for (const u of tries) {
-          const res = await fetcher(u, { signal, method: "GET" });
-          if (res.ok) return { ok: true, status: res.status };
+        // llama-server exposes GET /health: 200 once the GGUF is loaded,
+        // 503 `{ error: { message: "Loading model" } }` while it isn't.
+        // The HTTP UI at GET / is 200 the whole time, so treating any 200
+        // as ready (and falling through from a live 503) marks the launcher
+        // ready in ~0.3s and 503s warmup/restore. Only fall back to GET /
+        // when /health is missing (kobold.cpp).
+        const origin = baseUrl.replace(/\/+$/, "");
+        const healthRes = await fetcher(`${origin}/health`, { signal, method: "GET" });
+        if (healthRes.ok) return { ok: true, status: healthRes.status };
+        if (healthRes.status === 404 || healthRes.status === 405) {
+          const rootRes = await fetcher(baseUrl, { signal, method: "GET" });
+          if (rootRes.ok) return { ok: true, status: rootRes.status };
+          return { ok: false, status: rootRes.status };
         }
-        return { ok: false, status: 0 };
+        return { ok: false, status: healthRes.status };
       } catch {
         return { ok: false, status: 0 };
       }

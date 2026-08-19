@@ -1066,6 +1066,9 @@ export class LlamaLauncher {
     while (Date.now() < deadline) {
       if (!this.proc) break;
       const h = await client.health();
+      // health() treats llama-server /health 503 (GGUF still loading) as
+      // not ready. Do not warm/restore until that probe is actually ok —
+      // otherwise both 503 and the slot tape are wasted.
       if (h.ok) {
         try {
           const cache = await ensurePromptPrefixCached({

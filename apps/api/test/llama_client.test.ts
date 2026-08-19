@@ -90,3 +90,53 @@ describe("llama client fetch timeouts", () => {
     expect(chunks).toEqual([]);
   });
 });
+
+describe("llama client health — llama-server vs kobold", () => {
+  function healthClient(
+    respond: (url: string) => { status: number; body?: string },
+  ): { client: ReturnType<typeof createLlamaClient>; urls: string[] } {
+    const urls: string[] = [];
+    const client = createLlamaClient("http://127.0.0.1:8090", async (url) => {
+      urls.push(String(url));
+      const { status, body } = respond(String(url));
+      return new Response(body ?? "", { status });
+    });
+    return { client, urls };
+  }
+
+  it("treats /health 503 as not ready even when GET / is 200", async () => {
+    const { client, urls } = healthClient((url) => {
+      if (url.endsWith("/health")) {
+        return {
+          status: 503,
+          body: JSON.stringify({ error: { message: "Loading model" } }),
+        };
+      }
+      return { status: 200, body: "<html>llama.cpp</html>" };
+    });
+    const h = await client.health();
+    expect(h.ok).toBe(false);
+    expect(h.status).toBe(503);
+    expect(urls).toEqual(["http://127.0.0.1:8090/health"]);
+  });
+
+  it("treats /health 200 as ready", async () => {
+    const { client, urls } = healthClient((url) => {
+      if (url.endsWith("/health")) return { status: 200, body: '{"status":"ok"}' };
+      return { status: 500 };
+    });
+    const h = await client.health();
+    expect(h).toEqual({ ok: true, status: 200 });
+    expect(urls).toEqual(["http://127.0.0.1:8090/health"]);
+  });
+
+  it("falls back to GET / when /health is missing (kobold)", async () => {
+    const { client, urls } = healthClient((url) => {
+      if (url.endsWith("/health")) return { status: 404 };
+      return { status: 200, body: "kobold" };
+    });
+    const h = await client.health();
+    expect(h).toEqual({ ok: true, status: 200 });
+    expect(urls).toEqual(["http://127.0.0.1:8090/health", "http://127.0.0.1:8090"]);
+  });
+});
