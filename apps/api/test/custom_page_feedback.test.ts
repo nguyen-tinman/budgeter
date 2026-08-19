@@ -176,16 +176,17 @@ describe("custom-page status is piped into the assistant's context every turn", 
 describe("situational authoring help", () => {
   it("is absent on a turn that has nothing to do with the page", async () => {
     const client = capturingClient([asstText("ok")]);
-    await ask(await freshApp(client), "what is my monthly take-home?");
+    await ask(await freshApp(client), "what's my leftover");
     expect(systemOf(client)).not.toContain("<CUSTOM_PAGE_AUTHORING>");
   });
 
   it("appears when the user asks for a chart, saving a get_custom_page round-trip", async () => {
     const client = capturingClient([asstText("ok")]);
-    await ask(await freshApp(client), "plot a chart of my retirement balance");
+    await ask(await freshApp(client), "Create a custom page that charts grocery/food spend by week");
     const sys = systemOf(client);
     expect(sys).toContain("<CUSTOM_PAGE_AUTHORING>");
     expect(sys).toContain("RENDER CONTRACT");
+    expect(sys).toContain("CUSTOM PAGE AUTHORING GUIDE");
   });
 
   it("appears on any turn while the page is broken, so the fix is at hand", async () => {
@@ -195,6 +196,24 @@ describe("situational authoring help", () => {
     const client = capturingClient([asstText("ok")]);
     await ask(await freshApp(client), "unrelated question about groceries");
     expect(systemOf(client)).toContain("<CUSTOM_PAGE_AUTHORING>");
+  });
+
+  it("stays injected on a follow-up of the same authoring task", async () => {
+    const client = capturingClient([asstText("ok")]);
+    const app = await freshApp(client);
+    await app.request("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        message: "make the bars green",
+        history: [
+          { role: "user", text: "Draw me a custom page with a bar chart of top 10 merchants" },
+          { role: "assistant", text: "I started gathering merchants." },
+        ],
+      }),
+    });
+    expect(systemOf(client)).toContain("<CUSTOM_PAGE_AUTHORING>");
+    expect(systemOf(client)).toContain("CUSTOM PAGE AUTHORING GUIDE");
   });
 });
 

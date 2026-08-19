@@ -14,6 +14,8 @@ import type {
 } from "../src/services/llama_client.js";
 import {
   buildSystemMessage,
+  buildContextMessage,
+  customPageAuthoringBlock,
   escapeForDataBlock,
   COMPACTION_THRESHOLD_TOKENS,
   CHARS_PER_TOKEN,
@@ -22,6 +24,7 @@ import {
   overflowTokensFromError,
   compactInFlight,
 } from "../src/routes/chat.js";
+import { CUSTOM_PAGE_GUIDE } from "@budgetkit/core";
 
 // Chars of message content guaranteed to exceed the compaction threshold,
 // derived from the live budget so these tests don't drift when the context
@@ -697,6 +700,54 @@ describe("buildSystemMessage — prompt-injection defense", () => {
     expect(sys).not.toMatch(/<WORKSPACE_DATA>/);
     expect(sys).not.toMatch(/<PRIOR_CONVERSATION_SUMMARY>/);
     expect(sys).toMatch(/You are BudgetKit's assistant/);
+  });
+});
+
+describe("custom-page authoring guide in the assembled context message", () => {
+  it("includes CUSTOM_PAGE_GUIDE on a first authoring ask, even when the page is healthy", () => {
+    const authoring = customPageAuthoringBlock({
+      userText: "Create a custom page that charts grocery/food spend by week",
+      status: null,
+    });
+    expect(authoring).toBe(CUSTOM_PAGE_GUIDE);
+    const ctx = buildContextMessage({ customPageAuthoring: authoring });
+    expect(ctx).toContain("<CUSTOM_PAGE_AUTHORING>");
+    expect(ctx).toContain("CUSTOM PAGE AUTHORING GUIDE");
+    expect(ctx).toContain("RENDER CONTRACT");
+  });
+
+  it("also fires for a draw-me / bar-chart authoring ask", () => {
+    const authoring = customPageAuthoringBlock({
+      userText: "Draw me a custom page with a bar chart of top 10 merchants",
+      status: { state: "blank", reportedAt: "2026-01-01T00:00:00Z" },
+    });
+    expect(authoring).toBe(CUSTOM_PAGE_GUIDE);
+    expect(buildContextMessage({ customPageAuthoring: authoring })).toContain(
+      "CUSTOM PAGE AUTHORING GUIDE",
+    );
+  });
+
+  it("omits the guide for a plain leftover budget question", () => {
+    const authoring = customPageAuthoringBlock({
+      userText: "what's my leftover",
+      status: null,
+    });
+    expect(authoring).toBeNull();
+    const ctx = buildContextMessage({ customPageAuthoring: authoring });
+    expect(ctx).not.toContain("CUSTOM PAGE AUTHORING GUIDE");
+    expect(ctx).not.toContain("<CUSTOM_PAGE_AUTHORING>");
+  });
+
+  it("keeps the guide on a follow-up of the same authoring task", () => {
+    const authoring = customPageAuthoringBlock({
+      userText: "make the bars green",
+      status: { state: "ok", reportedAt: "2026-01-01T00:00:00Z" },
+      recentUserTexts: ["Draw me a custom page with a bar chart of top 10 merchants"],
+    });
+    expect(authoring).toBe(CUSTOM_PAGE_GUIDE);
+    expect(buildContextMessage({ customPageAuthoring: authoring })).toContain(
+      "CUSTOM PAGE AUTHORING GUIDE",
+    );
   });
 });
 

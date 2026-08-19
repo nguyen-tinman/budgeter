@@ -18,7 +18,8 @@
     "@budgetkit/core": "workspace:*",
     "@budgetkit/db": "workspace:*",
     "@hono/node-server": "^1.13.7",
-    "hono": "^4.6.10"
+    "hono": "^4.6.10",
+    "undici": "^7.29.0"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

@@ -62,6 +62,9 @@ import {
 import {
   createLlamaClient,
   toolsToOpenAi,
+  llamaCallTimeoutMs,
+  LLAMA_STREAM_IDLE_TIMEOUT_MS,
+  LLAMA_STREAM_FIRST_CHUNK_TIMEOUT_MS,
   type ChatMessage,
   type LlamaClient,
 } from "../services/llama_client.js";
@@ -73,6 +76,15 @@ import {
   recommendWorkspaceExpenses,
   applyExpenseCategories,
 } from "../services/expense_classifier.js";
+
+/** Re-exported so existing tests can keep importing the timeout policy from
+ *  the chat route. The numbers live next to the fetch dispatcher they must
+ *  outrun (see llama_client.ts). */
+export {
+  llamaCallTimeoutMs,
+  LLAMA_CALL_BASE_TIMEOUT_MS,
+  LLAMA_MS_PER_REPLY_TOKEN,
+} from "../services/llama_client.js";
 
 /** Turn budget for one request's tool-calling loop. Generous by design: a
  *  multi-step task (read a guide, query data, then write) plus a few recovery
@@ -191,22 +203,12 @@ const SUMMARY_HARD_CHAR_CAP = Math.floor(PRIOR_SUMMARY_MAX_TOKENS * CHARS_PER_TO
  *
  *  Either way the AbortController plumbed into LlamaClient.chat/chatStream
  *  propagates to the fetch via signal — it rejects when the timer fires,
- *  which the caller surfaces as an llm_unreachable response. */
-export const LLAMA_CALL_BASE_TIMEOUT_MS = 60_000;
-/** Per-reply-token allowance for blocking calls (~33 tok/s floor). */
-export const LLAMA_MS_PER_REPLY_TOKEN = 30;
-/** Streaming: max gap between chunks before the server is presumed dead. */
-const LLAMA_STREAM_IDLE_TIMEOUT_MS = 60_000;
-/** Streaming: window for the FIRST chunk, which arrives only after the full
- *  prompt prefill. A near-full 128k-token prompt can take >60s to process on
- *  slower backends; 180s matches the launcher's startup health deadline. */
-const LLAMA_STREAM_FIRST_CHUNK_TIMEOUT_MS = 180_000;
-
-/** Wall-clock ceiling for a BLOCKING llama call expected to emit up to
- *  `maxTokens` reply tokens. Exported for tests. */
-export function llamaCallTimeoutMs(maxTokens: number): number {
-  return LLAMA_CALL_BASE_TIMEOUT_MS + maxTokens * LLAMA_MS_PER_REPLY_TOKEN;
-}
+ *  which the caller surfaces as an llm_unreachable response.
+ *
+ *  The fetch itself must also honor this policy: llama-server only writes
+ *  HTTP headers when a blocking completion finishes, so Node/undici's
+ *  default 300s headersTimeout would 502 the call first. That dispatcher
+ *  lives in llama_client.ts, sized from the same constants. */
 
 /** Wrap a llama call with a wall-clock timeout. The inner function receives
  *  an AbortSignal it must pass to client.chat / client.health. We use this
@@ -770,7 +772,21 @@ const CUSTOM_PAGE_INTENT = [
   "visualize",
   "visualise",
   "draw me",
+  "create a page",
+  "make a page",
+  "build a page",
 ];
+
+/** How many prior user turns to scan for authoring intent. A follow-up like
+ *  "make the bars green" has none of the keywords, but it is still the same
+ *  task; looking further back than a couple of turns starts tagging leftover
+ *  / budget questions after an earlier chart request. */
+const AUTHORING_HISTORY_USER_TURNS = 4;
+
+function textHasCustomPageIntent(text: string): boolean {
+  const lower = text.toLowerCase();
+  return CUSTOM_PAGE_INTENT.some((k) => lower.includes(k));
+}
 
 /**
  * Task-specific authoring help, assembled ONLY on turns that are about the
@@ -778,17 +794,25 @@ const CUSTOM_PAGE_INTENT = [
  * come straight out of the usable context window (see TOOLS_PREFILL_TOKENS),
  * and paying it on none of them costs a mandatory get_custom_page round-trip
  * before the model can write anything.
+ *
+ * Injected on the FIRST authoring turn (not only after a failed page): a
+ * 2B model that has to fetch the guide via get_custom_page{includeGuide:true}
+ * often never does, then writes an incomplete set_custom_page.
  */
 export function customPageAuthoringBlock(opts: {
   userText: string;
   status: CustomPageStatus | null;
+  /** Prior user turns, newest last. Follow-ups of the same authoring task
+   *  keep the guide even when the latest message has no intent keywords. */
+  recentUserTexts?: readonly string[];
 }): string | null {
   // A failing page is included even on an unrelated turn: the model is being
   // told about the breakage anyway, and telling it without also telling it how
   // to write a correct definition is what produced the retry loop.
   const failing =
     !!opts.status && opts.status.state !== "ok" && opts.status.state !== "blank";
-  const asked = CUSTOM_PAGE_INTENT.some((k) => opts.userText.toLowerCase().includes(k));
+  const recent = (opts.recentUserTexts ?? []).slice(-AUTHORING_HISTORY_USER_TURNS);
+  const asked = [opts.userText, ...recent].some(textHasCustomPageIntent);
   if (!failing && !asked) return null;
   return CUSTOM_PAGE_GUIDE;
 }
@@ -1872,10 +1896,6 @@ async function prepareTurn(
   // The page's last word from the browser. Injected on EVERY turn, clean or
   // not, so "no errors on custom page" is a statement rather than an absence.
   const customPageStatus = readCustomPageStatus(appSettingsRepo(db));
-  const customPageAuthoring = customPageAuthoringBlock({
-    userText: body.message,
-    status: customPageStatus,
-  });
 
   const rawHistory = Array.isArray(body.history) ? body.history : [];
   const cappedHistory = rawHistory
@@ -1887,6 +1907,15 @@ async function prepareTurn(
         typeof h.text === "string",
     )
     .slice(-HISTORY_MAX_ENTRIES);
+  const recentUserTexts = cappedHistory
+    .filter((h) => h.role === "user")
+    .slice(-AUTHORING_HISTORY_USER_TURNS)
+    .map((h) => h.text);
+  const customPageAuthoring = customPageAuthoringBlock({
+    userText: body.message,
+    status: customPageStatus,
+    recentUserTexts,
+  });
 
   let priorSummary: string | null =
     typeof body.priorSummary === "string" && body.priorSummary.trim().length > 0
