@@ -33,7 +33,12 @@ import {
   defaultProfile,
   LlamaLauncher,
 } from "../src/services/llama_launcher.js";
-import { wrappedSystemPrompt, chatRequestOptions } from "../src/routes/chat.js";
+import {
+  wrappedSystemPrompt,
+  chatRequestOptions,
+  buildContextMessage,
+  CONTEXT_MESSAGE_ROLE,
+} from "../src/routes/chat.js";
 
 const SYSTEM = "<SYSTEM_PROMPT>\nrules\n</SYSTEM_PROMPT>";
 
@@ -150,6 +155,36 @@ describe("buildStaticPrefixWarmupRequest", () => {
     expect(req.chat_template_kwargs).toEqual({ enable_thinking: true });
     expect(req.temperature).toBe(0.6);
     expect(req.max_tokens).toBe(1);
+  });
+
+  it("leading system + tools + kwargs is a prefix of a live history with a context block", () => {
+    // Qwen 3.5 merges messages[0]+messages[1] when both are system and, with
+    // tools, emits one system block (catalog first, then merged_system). A
+    // first turn always has a context block (page status at minimum). If that
+    // block stays system-role, the live turn extends the warmed system
+    // instead of appending after <|im_end|>.
+    const warmup = buildStaticPrefixWarmupRequest(wrappedSystemPrompt(), chatRequestOptions());
+    const context = buildContextMessage({
+      workspaceSummary:
+        "You are the user's local budget assistant. Here is the CURRENT workspace state:\nWorkspace #1 Current rent $2000",
+      customPageStatus: null,
+      customPageAuthoring: "CUSTOM PAGE AUTHORING GUIDE — render contract",
+    });
+    expect(context).toMatch(/WORKSPACE_DATA|CUSTOM_PAGE_STATUS|CUSTOM_PAGE_AUTHORING/);
+
+    const liveHistory = [
+      { role: "system" as const, content: wrappedSystemPrompt() },
+      { role: CONTEXT_MESSAGE_ROLE, content: context },
+      { role: "user" as const, content: "hi" },
+    ];
+
+    expect(liveHistory[0]).toEqual(warmup.messages[0]);
+    expect(liveHistory.filter((m) => m.role === "system")).toHaveLength(1);
+    expect(liveHistory[1]?.role).not.toBe("system");
+    expect(warmup.tools).toEqual(toolsToOpenAi(ALL_TOOLS));
+    expect(warmup.chat_template_kwargs).toEqual(chatRequestOptions().chat_template_kwargs);
+    expect(JSON.stringify(warmup.messages[0])).not.toContain("WORKSPACE_DATA");
+    expect(JSON.stringify(warmup.messages[0])).not.toContain("CUSTOM_PAGE");
   });
 });
 
@@ -287,6 +322,56 @@ describe("LlamaLauncher — prompt-prefix cache at start", () => {
       stdout: new EventEmitter(),
     });
   }
+
+  it("does not warm or restore until health() reports ready", async () => {
+    const dir = tmpCache();
+    let healthCalls = 0;
+    let chatCalls = 0;
+    let restoreCalls = 0;
+    try {
+      const launcher = new LlamaLauncher({
+        binPath: process.execPath,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        spawnFn: (() => fakeProc()) as any,
+        portProbe: async () => true,
+        promptCache: {
+          getSystemPrompt: () => SYSTEM,
+          getRequestDefaults: () => DEFAULTS,
+        },
+        client: {
+          baseUrl: "stub://",
+          health: async () => {
+            healthCalls++;
+            if (healthCalls < 3) return { ok: false, status: 503 };
+            return { ok: true, status: 200 };
+          },
+          chat: async () => {
+            chatCalls++;
+            return okChat();
+          },
+          restoreSlot: async (filename) => {
+            restoreCalls++;
+            return { id_slot: 0, filename, n_restored: 1 };
+          },
+          saveSlot: async (_id, filename) => {
+            writeFileSync(join(dir, filename), "kv");
+            return { id_slot: 0, filename, n_saved: 1 };
+          },
+        },
+      });
+      const r = await launcher.start({
+        ...defaultProfile(),
+        modelPath: "/m.gguf",
+        slotSavePath: dir,
+      });
+      expect(r.status).toBe("ready");
+      expect(healthCalls).toBeGreaterThanOrEqual(3);
+      expect(chatCalls).toBe(1);
+      expect(restoreCalls).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("starts ready even when warmup fails, and still passed --slot-save-path", async () => {
     const dir = tmpCache();
