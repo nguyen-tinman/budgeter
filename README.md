@@ -26,10 +26,10 @@ retirement; and (optionally) chat with a fully-offline AI assistant.
 
 ```bash
 # Windows
-run.bat
+windows_start.bat
 
-# macOS / Linux
-bash run.sh
+# Linux (also works on macOS)
+bash linux_start.sh
 ```
 
 The script installs dependencies on first run, builds the shared packages, starts the API
