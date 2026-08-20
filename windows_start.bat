@@ -6,6 +6,8 @@ REM  Starts the API (http://127.0.0.1:3000) + web UI (http://localhost:5173)
 REM  dev servers. Portable: runs from this script's own folder, so it works
 REM  wherever the repo lives -- no hardcoded paths.
 REM
+REM  Pair: linux_start.sh is the same launcher for Linux (and macOS).
+REM
 REM  What it does:
 REM    1. verifies pnpm is on PATH
 REM    2. installs dependencies on first run (if node_modules is missing)

@@ -3,7 +3,7 @@
 * text=auto
 
 # Shell scripts must stay LF even on a Windows checkout — a CRLF in the shebang
-# line breaks `bash run.sh` on macOS/Linux ("bad interpreter").
+# line breaks `bash linux_start.sh` on Linux ("bad interpreter").
 *.sh text eol=lf
 
 # Windows batch files want CRLF.

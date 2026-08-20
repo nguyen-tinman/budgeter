@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==========================================================================
-#  BudgetKit launcher (macOS / Linux). Mirrors run.bat.
+#  BudgetKit launcher (Linux; also works on macOS). Mirrors windows_start.bat.
 #  Starts the API (http://127.0.0.1:3000) + web UI (http://localhost:5173)
 #  dev servers. Portable: runs from this script's own folder, so it works
 #  wherever the repo lives -- no hardcoded paths.
